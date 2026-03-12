@@ -1,6 +1,6 @@
 import { dirname, join, resolve } from "node:path";
 import { mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
-import { getAgnoraHome } from "jsr:@agnora/sdk@^0.2";
+import { getPonsHome } from "jsr:@pons/sdk@^0.2";
 import { ConfigManager } from "./config/manager.ts";
 import { createLogger } from "./logs/logger.ts";
 import type { KernelLogger } from "./logs/logger.ts";
@@ -43,16 +43,16 @@ export default class Kernel {
 
   constructor(
     private readonly logLevel?: string,
-    configPath: string = join(getAgnoraHome(), "config.yaml"),
+    configPath: string = join(getPonsHome(), "config.yaml"),
   ) {
     this.version = readVersion();
-    const logDir = join(getAgnoraHome(), ".runtime", "logs");
+    const logDir = join(getPonsHome(), ".runtime", "logs");
     this.logger = createLogger({
       level: (this.logLevel || "info") as LogLevel,
       levels: {},
       logDir,
     });
-    this.modulesDir = resolve(getAgnoraHome(), "modules");
+    this.modulesDir = resolve(getPonsHome(), "modules");
 
     this.configManager = new ConfigManager(configPath);
     this.bus = new MessageBus();
@@ -60,7 +60,7 @@ export default class Kernel {
     this.lifecycle = new LifecycleManager(
       this.logger,
       this.bus,
-      { config, workspacePath: getAgnoraHome(), projectRoot: getAgnoraHome() },
+      { config, workspacePath: getPonsHome(), projectRoot: getPonsHome() },
       (moduleId, method, params) =>
         this.handleModuleCall(moduleId, method, params),
     );
@@ -95,7 +95,7 @@ export default class Kernel {
     }
 
     this._config = config;
-    const configSource = join(getAgnoraHome(), "config.yaml");
+    const configSource = join(getPonsHome(), "config.yaml");
     this.printStartupBanner(configSource, [configSource]);
 
     // Message bus
@@ -105,7 +105,7 @@ export default class Kernel {
     this._lifecycle = new LifecycleManager(
       this.logger,
       this.bus,
-      { config, workspacePath: getAgnoraHome(), projectRoot: getAgnoraHome() },
+      { config, workspacePath: getPonsHome(), projectRoot: getPonsHome() },
       (moduleId, method, params) =>
         this.handleModuleCall(moduleId, method, params),
     );
@@ -186,7 +186,7 @@ export default class Kernel {
     this.logger.info("Kernel running");
 
     // Write PID file for CLI process management
-    const runtimeDir = join(getAgnoraHome(), ".runtime");
+    const runtimeDir = join(getPonsHome(), ".runtime");
     mkdirSync(runtimeDir, { recursive: true });
     writeFileSync(join(runtimeDir, "kernel.pid"), String(process.pid), "utf-8");
 
@@ -201,7 +201,7 @@ export default class Kernel {
 
     // Remove PID file
     try {
-      unlinkSync(join(getAgnoraHome(), ".runtime", "kernel.pid"));
+      unlinkSync(join(getPonsHome(), ".runtime", "kernel.pid"));
     } catch { /* may not exist */ }
 
     Deno.exit(0);
@@ -258,7 +258,7 @@ export default class Kernel {
 
   private printStartupBanner(configSource: string, loadedFiles: string[]) {
     this.logger.info("─".repeat(60));
-    this.logger.info(`Agnora Kernel v${this.version}`);
+    this.logger.info(`Pons Kernel v${this.version}`);
     this.logger.info({
       _groupItems: [
         { msg: `Config      ${configSource}` },
@@ -266,7 +266,7 @@ export default class Kernel {
           ? loadedFiles.slice(1).map((f) => ({ msg: `  merged     ${f}` }))
           : []),
         { msg: `Log level   ${this.logLevel || "info"}` },
-        { msg: `Home        ${getAgnoraHome()}` },
+        { msg: `Home        ${getPonsHome()}` },
         { msg: `Modules     ${this.modulesDir}` },
       ],
     }, "Configuration");

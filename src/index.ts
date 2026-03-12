@@ -1,5 +1,5 @@
 /**
- * Agnora Kernel — microkernel entry point.
+ * Pons Kernel — microkernel entry point.
  *
  * Responsibilities (and only these):
  *   1. In-memory message bus (pub/sub forwarding)
@@ -14,7 +14,7 @@
 import { join } from "node:path";
 import type { LogLevel } from "./config/types.ts";
 import Kernel from './kernel.ts';
-import { getAgnoraHome } from "jsr:@agnora/sdk@0.2";
+import { getPonsHome } from "jsr:@pons/sdk@0.2";
 
 
 interface ParsedArgs {
@@ -37,7 +37,7 @@ function parseArgs(): ParsedArgs {
 }
 
 const {logLevel, daemon} = parseArgs();
-const configPath = join(getAgnoraHome(), "config.yaml");
+const configPath = join(getPonsHome(), "config.yaml");
 
 const kernel = new Kernel(logLevel);
 

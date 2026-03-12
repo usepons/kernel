@@ -8,7 +8,7 @@
 
 import { join } from 'node:path';
 import { existsSync, readdirSync, statSync, readFileSync } from 'node:fs';
-import type { ModuleManifest } from 'jsr:@agnora/sdk@^0.2';
+import type { ModuleManifest } from 'jsr:@pons/sdk@^0.2';
 import { createLogger, type KernelLogger } from '../logs/logger.ts';
 
 export interface DiscoveredModule {

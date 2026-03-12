@@ -1,7 +1,7 @@
 /**
  * Module install / uninstall logic for the kernel.
  *
- * Modules are published to JSR under `@agnora/module-<name>` and installed
+ * Modules are published to JSR under `@pons/module-<name>` and installed
  * by downloading all package files from the JSR registry API.
  *
  * Also supports local paths and git URLs for development.
@@ -21,8 +21,8 @@ import {
 import { dirname, join, resolve } from "node:path";
 import ora from "npm:ora@^8.2.0";
 import chalk from "npm:chalk@^5.6.2";
-import { getAgnoraHome } from "jsr:@agnora/sdk@^0.2";
-import type { ModuleManifest } from "jsr:@agnora/sdk@^0.2";
+import { getPonsHome } from "jsr:@pons/sdk@^0.2";
+import type { ModuleManifest } from "jsr:@pons/sdk@^0.2";
 import { printError, printWarning } from "../formatters.ts";
 
 // --- JSR API Types ---
@@ -81,7 +81,7 @@ function extractModuleName(nameOrUrl: string): string {
 
 // --- JSR Helpers ---
 
-const JSR_SCOPE = "agnora";
+const JSR_SCOPE = "pons";
 const JSR_BASE = "https://jsr.io";
 
 /**
@@ -174,17 +174,17 @@ function stampModuleVersion(targetDir: string, version: string): void {
  * Resolution order:
  *   1. Local path  — starts with `./ | ../ | /`  → symlink
  *   2. Git URL     — contains `://` or ends `.git` → git clone
- *   3. JSR package — bare name like `llm` → resolves `@agnora/module-llm` on JSR
+ *   3. JSR package — bare name like `llm` → resolves `@pons/module-llm` on JSR
  *
  * @param nameOrUrl - Local path, git URL, or module name (optionally with @version)
- * @param agnoraHome - Override for AGNORA_HOME directory
+ * @param ponsHome - Override for PONS_HOME directory
  * @returns true if installation succeeded
  */
 export async function installModule(
   nameOrUrl: string,
-  agnoraHome?: string,
+  ponsHome?: string,
 ): Promise<boolean> {
-  const home = agnoraHome || getAgnoraHome();
+  const home = ponsHome || getPonsHome();
   const modulesDir = join(home, "modules");
 
   // Ensure modules directory exists

@@ -1,6 +1,6 @@
 {
   "id": "kernel",
-  "name": "Agnora Kernel",
+  "name": "Pons Kernel",
   "entrypoint": "src/index.ts",
   "cli": {
     "entrypoint": "src/cli.ts"

@@ -4,7 +4,7 @@
  */
 
 import type { ChildProcess } from 'node:child_process';
-import type { ModuleManifest } from 'jsr:@agnora/sdk@^0.2';
+import type { ModuleManifest } from 'jsr:@pons/sdk@^0.2';
 
 export type ModuleStatus = 'starting' | 'ready' | 'restarting' | 'stopped' | 'crashed';
 

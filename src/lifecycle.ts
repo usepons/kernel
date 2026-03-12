@@ -18,7 +18,7 @@ import type { KernelLogger } from './logs/logger.ts';
 import { writeModuleLog, writeModuleLogGroup } from './logs/logger.ts';
 import type { MessageBus } from './messaging/bus.ts';
 import { ModuleRegistry } from './module/registry.ts';
-import type { KernelMessage, ModuleMessage, ModuleManifest } from 'jsr:@agnora/sdk@^0.2';
+import type { KernelMessage, ModuleMessage, ModuleManifest } from 'jsr:@pons/sdk@^0.2';
 
 
 const VALID_MODULE_TYPES = new Set([

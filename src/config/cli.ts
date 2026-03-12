@@ -9,8 +9,8 @@ import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import chalk from "npm:chalk@^5.6.2";
-import { getAgnoraHome } from "jsr:@agnora/sdk@^0.2";
-import type { ModuleManifest } from "jsr:@agnora/sdk@^0.2";
+import { getPonsHome } from "jsr:@pons/sdk@^0.2";
+import type { ModuleManifest } from "jsr:@pons/sdk@^0.2";
 import { ConfigManager } from "./manager.ts";
 import { printHeader, printError, printWarning } from "../formatters.ts";
 
@@ -48,7 +48,7 @@ function discoverModules(home: string): Array<{ manifest: ModuleManifest; module
  * Create a ConfigManager with all schemas loaded.
  */
 async function createManager(): Promise<ConfigManager> {
-  const home = getAgnoraHome();
+  const home = getPonsHome();
   const manager = new ConfigManager(join(home, "config.yaml"));
   const modules = discoverModules(home);
   await manager.discoverSchemas(modules);
@@ -60,7 +60,7 @@ async function createManager(): Promise<ConfigManager> {
  * Check if kernel is running and send config update signal.
  */
 function notifyKernel(changedKeys: string[]): void {
-  const home = getAgnoraHome();
+  const home = getPonsHome();
   const pidPath = join(home, ".runtime", "kernel.pid");
   if (!existsSync(pidPath)) return;
 
@@ -107,7 +107,7 @@ function printTree(data: Record<string, unknown>, prefix = ""): void {
 export function initConfigCommands(program: Command): void {
   const config = program
     .command("config")
-    .description("Manage Agnora configuration");
+    .description("Manage Pons configuration");
 
   /* ---- config get ---- */
   config
@@ -221,7 +221,7 @@ export function initConfigCommands(program: Command): void {
     .command("edit")
     .description("Open config.yaml in $EDITOR")
     .action(async () => {
-      const home = getAgnoraHome();
+      const home = getPonsHome();
       const configPath = join(home, "config.yaml");
       const editor = process.env["EDITOR"] || process.env["VISUAL"] || "vi";
 
@@ -231,7 +231,7 @@ export function initConfigCommands(program: Command): void {
       const manager = await createManager();
       const report = manager.diagnose();
       if (!report.valid) {
-        printWarning("Config has validation issues after edit. Run 'agnora config doctor' to fix.");
+        printWarning("Config has validation issues after edit. Run 'pons config doctor' to fix.");
       } else {
         console.log(chalk.green("✓ Config is valid"));
         notifyKernel([]);

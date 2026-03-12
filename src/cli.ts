@@ -24,8 +24,8 @@ import { join } from "node:path";
 import { Buffer } from "node:buffer";
 import chalk from "npm:chalk@^5.6.2";
 import ora from "npm:ora@^8.2.0";
-import { getAgnoraHome } from "jsr:@agnora/sdk@^0.2";
-import type { ModuleManifest } from "jsr:@agnora/sdk@^0.2";
+import { getPonsHome } from "jsr:@pons/sdk@^0.2";
+import type { ModuleManifest } from "jsr:@pons/sdk@^0.2";
 import {
   createTable,
   outputJson,
@@ -218,7 +218,6 @@ function spawnDetached(home: string, logLevel?: string): void {
     args.push("--log-level", logLevel);
   }
 
-  // Redirect stdout/stderr to the kernel log directory so errors show in `agnora kernel logs`
   const logsDir = join(runtimeDir(home), "logs");
   if (!existsSync(logsDir)) mkdirSync(logsDir, { recursive: true });
   const outFd = openSync(join(logsDir, `kernel-${todayStamp()}.log`), "a");
@@ -226,7 +225,7 @@ function spawnDetached(home: string, logLevel?: string): void {
   const child = spawn("deno", args, {
     stdio: ["ignore", outFd, outFd],
     detached: true,
-    env: { ...process.env, AGNORA_HOME: home },
+    env: { ...Deno.env, PONS_HOME: home },
   });
 
   child.once("error", (err) => {
@@ -275,7 +274,7 @@ export function init(program: Command): void {
     .option("-f, --force", "Kill an existing kernel before starting")
     .option("--log-level <level>", "Set the kernel log level")
     .action(async (opts: { detach?: boolean; force?: boolean; logLevel?: string }) => {
-      const home = getAgnoraHome();
+      const home = getPonsHome();
       const existingPid = readPid(home);
 
       if (existingPid !== null && isProcessRunning(existingPid)) {
@@ -304,7 +303,7 @@ export function init(program: Command): void {
     .command("stop")
     .description("Stop the running kernel")
     .action(async () => {
-      const home = getAgnoraHome();
+      const home = getPonsHome();
       const stopped = await stopKernel(home);
       if (!stopped) {
         console.log("Kernel is not running.");
@@ -318,7 +317,7 @@ export function init(program: Command): void {
     .option("-d, --detach", "Run the kernel in the background after restart")
     .option("--log-level <level>", "Set the kernel log level")
     .action(async (opts: { detach?: boolean; logLevel?: string }) => {
-      const home = getAgnoraHome();
+      const home = getPonsHome();
 
       // Stop existing kernel if running
       await stopKernel(home);
@@ -336,7 +335,7 @@ export function init(program: Command): void {
     .command("status")
     .description("Show the kernel status")
     .action(async () => {
-      const home = getAgnoraHome();
+      const home = getPonsHome();
       const pid = readPid(home);
 
       // PID status
@@ -378,7 +377,7 @@ export function init(program: Command): void {
     .option("--date <YYYY-MM-DD>", "Show logs from a specific date")
     .option("--list", "List available log files")
     .action(async (opts: { lines: string; date?: string; list?: boolean }) => {
-      const home = getAgnoraHome();
+      const home = getPonsHome();
       const logsDir = join(home, ".runtime", "logs");
 
       if (!existsSync(logsDir)) {
@@ -462,11 +461,11 @@ export function init(program: Command): void {
   modules
     .command("list")
     .description("List installed modules")
-    .option("--home <path>", "Override AGNORA_HOME directory")
+    .option("--home <path>", "Override PONS_HOME directory")
     .option("--json", "Output as JSON")
     .action(async (opts: { home?: string; json?: boolean }) => {
       const json = opts.json ?? false;
-      const home = opts.home || getAgnoraHome();
+      const home = opts.home || getPonsHome();
       const modulesDir = join(home, "modules");
 
       if (!existsSync(modulesDir)) {
@@ -475,7 +474,7 @@ export function init(program: Command): void {
         } else {
           console.log(
             chalk.dim(
-              "  No modules installed. Run `npx @agnora/cli onboard` first.",
+              "  No modules installed. Run `npx @pons/cli onboard` first.",
             ),
           );
           console.log();
@@ -554,7 +553,7 @@ export function init(program: Command): void {
   modules
     .command("install <module>")
     .description("Install a module from npm, git URL, or local path")
-    .option("--home <path>", "Override AGNORA_HOME directory")
+    .option("--home <path>", "Override PONS_HOME directory")
     .option("--json", "Output as JSON")
     .action(async (moduleName: string, opts: { home?: string; json?: boolean }) => {
       const json = opts.json ?? false;
@@ -574,11 +573,11 @@ export function init(program: Command): void {
   modules
     .command("uninstall <module>")
     .description("Uninstall an installed module")
-    .option("--home <path>", "Override AGNORA_HOME directory")
+    .option("--home <path>", "Override PONS_HOME directory")
     .option("--json", "Output as JSON")
     .action(async (moduleName: string, opts: { home?: string; json?: boolean }) => {
       const json = opts.json ?? false;
-      const home = opts.home || getAgnoraHome();
+      const home = opts.home || getPonsHome();
       const modulesDir = join(home, "modules");
       const moduleDir = join(modulesDir, moduleName);
 
@@ -654,11 +653,11 @@ export function init(program: Command): void {
     .command("update [module]")
     .description("Update installed module(s)")
     .option("--all", "Update all installed modules")
-    .option("--home <path>", "Override AGNORA_HOME directory")
+    .option("--home <path>", "Override PONS_HOME directory")
     .option("--json", "Output as JSON")
     .action(async (moduleName: string | undefined, opts: { all?: boolean; home?: string; json?: boolean }) => {
       const json = opts.json ?? false;
-      const home = opts.home || getAgnoraHome();
+      const home = opts.home || getPonsHome();
       const modulesDir = join(home, "modules");
 
       if (!existsSync(modulesDir)) {
@@ -772,7 +771,7 @@ export function init(program: Command): void {
           console.log(
             chalk.yellow("  Restart the gateway for changes to take effect."),
           );
-          console.log(chalk.dim("    agnora gateway restart"));
+          console.log(chalk.dim("    pons gateway restart"));
           console.log();
         }
       }
