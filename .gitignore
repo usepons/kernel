@@ -1,0 +1,16 @@
+# Dependencies
+node_modules/
+deno.lock
+
+# Runtime
+.runtime/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo

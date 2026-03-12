@@ -1,0 +1,9 @@
+{
+  "id": "kernel",
+  "name": "Agnora Kernel",
+  "entrypoint": "src/index.ts",
+  "cli": {
+    "entrypoint": "src/cli.ts"
+  },
+  "provides": ["module.loader", "bus", "lifecycle"]
+}

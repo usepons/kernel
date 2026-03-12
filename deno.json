@@ -1,0 +1,17 @@
+{
+  "name": "@agnora/kernel",
+  "version": "0.2.2",
+  "license": "MIT",
+
+  "exports": {
+    ".": "./src/index.ts",
+    "./cli": "./src/cli.ts",
+    "./module-loader": "./src/module/loader.ts",
+    "./config": "./src/config/manager.ts"
+  },
+
+  "tasks": {
+    "dev": "deno run --allow-all --watch src/index.ts",
+    "start": "deno run --allow-all src/index.ts"
+  }
+}
