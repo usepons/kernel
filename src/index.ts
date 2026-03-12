@@ -18,32 +18,29 @@ import { getPonsHome } from "jsr:@pons/sdk@0.2";
 
 
 interface ParsedArgs {
-  daemon: boolean;
   logLevel: LogLevel;
 }
 
 function parseArgs(): ParsedArgs {
   const args = Deno.args;
-  let daemon = false;
   let logLevel = 'info' as LogLevel;
   
 
   for (let i = 0; i < args.length; i++) {
-    if (args[i] === '-d' || args[i] === '--daemon' || args[i] === '--background') daemon = true;
     if (args[i] === '-log-level' || args[i] === '--log') logLevel = args[i + 1] as LogLevel;
   }
 
-  return { daemon, logLevel };
+  return { logLevel };
 }
 
-const {logLevel, daemon} = parseArgs();
+const {logLevel} = parseArgs();
 const configPath = join(getPonsHome(), "config.yaml");
 
-const kernel = new Kernel(logLevel);
+const kernel = new Kernel(logLevel, configPath);
 
 kernel
-  .boot(configPath)
-  .then(() => kernel.start(daemon))
+  .boot()
+  .then(() => kernel.start())
   .then(() => {
     // Block forever — kernel runs until SIGINT/SIGTERM triggers shutdown()
     return new Promise(() => {});

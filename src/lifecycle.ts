@@ -13,6 +13,7 @@ import { fork, spawn as spawnChild } from 'node:child_process';
 import { Buffer } from 'node:buffer';
 import { randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
+import type { DiscoveredModule } from './module/loader.ts';
 import { dirname, join } from 'node:path';
 import type { KernelLogger } from './logs/logger.ts';
 import { writeModuleLog, writeModuleLogGroup } from './logs/logger.ts';

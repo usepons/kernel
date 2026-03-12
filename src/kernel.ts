@@ -46,21 +46,21 @@ export default class Kernel {
     configPath: string = join(getPonsHome(), "config.yaml"),
   ) {
     this.version = readVersion();
+    this.modulesDir = resolve(getPonsHome(), "modules");
     const logDir = join(getPonsHome(), ".runtime", "logs");
     this.logger = createLogger({
       level: (this.logLevel || "info") as LogLevel,
       levels: {},
       logDir,
     });
-    this.modulesDir = resolve(getPonsHome(), "modules");
 
     this.configManager = new ConfigManager(configPath);
     this.bus = new MessageBus();
-    this.moduleLoader = new ModuleLoader();
+    this.moduleLoader = new ModuleLoader(this.modulesDir);
     this.lifecycle = new LifecycleManager(
       this.logger,
       this.bus,
-      { config, workspacePath: getPonsHome(), projectRoot: getPonsHome() },
+      { config: this.configManager.getAll(), workspacePath: getPonsHome(), projectRoot: getPonsHome() },
       (moduleId, method, params) =>
         this.handleModuleCall(moduleId, method, params),
     );
@@ -71,11 +71,10 @@ export default class Kernel {
    */
   async boot(): Promise<this> {
     // Discover modules first (need manifests for schema discovery)
-    const loader = new ModuleLoader(this.logger);
-    this.modules = loader.discover(this.modulesDir);
+    this.modules = await this.moduleLoader.discover();
 
     // Discover schemas from modules
-    await this._configManager.discoverSchemas(
+    await this.configManager.discoverSchemas(
       this.modules.map((m) => ({
         manifest: m.manifest,
         moduleDir: m.moduleDir,
@@ -83,7 +82,7 @@ export default class Kernel {
     );
 
     // Load and validate config
-    const config = this._configManager.load();
+    const config = this.configManager.load();
 
     if (this.logLevel) {
       if (!config.logging) {
@@ -102,7 +101,7 @@ export default class Kernel {
     this.logger.info("Message bus ready");
 
     // Lifecycle manager
-    this._lifecycle = new LifecycleManager(
+    this.lifecycle = new LifecycleManager(
       this.logger,
       this.bus,
       { config, workspacePath: getPonsHome(), projectRoot: getPonsHome() },

@@ -79,7 +79,6 @@ deno install -gA -n pons-kernel jsr:@pons/kernel
 ```bash
 pons-kernel                    # start
 pons-kernel --log debug        # verbose logging
-pons-kernel -d                 # daemon mode
 ```
 
 ## Core Concepts

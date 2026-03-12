@@ -225,7 +225,7 @@ function spawnDetached(home: string, logLevel?: string): void {
   const child = spawn("deno", args, {
     stdio: ["ignore", outFd, outFd],
     detached: true,
-    env: { ...Deno.env, PONS_HOME: home },
+    env: { ...Deno.env.toObject(), PONS_HOME: home },
   });
 
   child.once("error", (err) => {

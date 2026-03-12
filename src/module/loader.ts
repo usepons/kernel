@@ -18,21 +18,24 @@ export interface DiscoveredModule {
 }
 
 export class ModuleLoader {
-  constructor(private readonly logger: KernelLogger) {
+
+  logger: KernelLogger;
+
+  constructor(private readonly modulesDir: string) {
     this.logger = createLogger()
   }
 
-  discover(modulesDir: string): DiscoveredModule[] {
-    if (!existsSync(modulesDir)) {
-      this.logger.warn({ modulesDir }, 'No modules directory found — nothing to discover');
+  discover(): DiscoveredModule[] {
+    if (!existsSync(this.modulesDir)) {
+      this.logger.warn({ modulesDir: this.modulesDir }, 'No modules directory found — nothing to discover');
       return [];
     }
 
-    this.logger.info({ modulesDir }, 'Scanning modules directory');
+    this.logger.info({ modulesDir: this.modulesDir }, 'Scanning modules directory');
     const discovered: DiscoveredModule[] = [];
 
-    for (const entry of readdirSync(modulesDir)) {
-      const moduleDir = join(modulesDir, entry);
+    for (const entry of readdirSync(this.modulesDir)) {
+      const moduleDir = join(this.modulesDir, entry);
 
       try {
         if (!statSync(moduleDir).isDirectory()) continue;
