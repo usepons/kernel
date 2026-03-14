@@ -6,22 +6,7 @@
  * communicates with the running gateway via its HTTP API.
  */
 
-import { spawn } from "node:child_process";
-import {
-  existsSync,
-  lstatSync,
-  mkdirSync,
-  readFileSync,
-  writeFileSync,
-  unlinkSync,
-  readdirSync,
-  rmSync,
-  statSync,
-  openSync,
-} from "node:fs";
-import { open } from "node:fs/promises";
-import { join } from "node:path";
-import { Buffer } from "node:buffer";
+import { join } from "jsr:@std/path";
 import chalk from "npm:chalk@^5.6.2";
 import ora from "npm:ora@^8.2.0";
 import { getPonsHome } from "jsr:@pons/sdk@^0.2";
@@ -35,6 +20,7 @@ import {
 } from "./formatters.ts";
 import {
   detectInstallSource,
+  displayAndApprovePermissions,
   getInstalledModules,
   installModule,
   updateModuleFromJsr,
@@ -57,10 +43,19 @@ function pidPath(home: string): string {
   return join(runtimeDir(home), "kernel.pid");
 }
 
+function existsSync(p: string): boolean {
+  try {
+    Deno.statSync(p);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function readPid(home: string): number | null {
   const p = pidPath(home);
   if (!existsSync(p)) return null;
-  const raw = readFileSync(p, "utf-8").trim();
+  const raw = Deno.readTextFileSync(p).trim();
   const pid = parseInt(raw, 10);
   return Number.isNaN(pid) ? null : pid;
 }
@@ -68,15 +63,15 @@ function readPid(home: string): number | null {
 function writePid(home: string, pid: number): void {
   const dir = runtimeDir(home);
   if (!existsSync(dir)) {
-    mkdirSync(dir, { recursive: true });
+    Deno.mkdirSync(dir, { recursive: true });
   }
-  writeFileSync(pidPath(home), String(pid), "utf-8");
+  Deno.writeTextFileSync(pidPath(home), String(pid));
 }
 
 function removePid(home: string): void {
   const p = pidPath(home);
   try {
-    unlinkSync(p);
+    Deno.removeSync(p);
   } catch {
     // file may already be gone
   }
@@ -84,7 +79,7 @@ function removePid(home: string): void {
 
 function isProcessRunning(pid: number): boolean {
   try {
-    process.kill(pid, 0);
+    Deno.kill(pid, "SIGCONT");
     return true;
   } catch {
     return false;
@@ -125,7 +120,7 @@ function resolveGatewayConfig(home: string): GatewayConnectionConfig {
   const configPath = join(home, "config.yaml");
   if (!existsSync(configPath)) return defaults;
   try {
-    const raw = readFileSync(configPath, "utf-8");
+    const raw = Deno.readTextFileSync(configPath);
     // Simple extraction — avoid pulling in a full YAML parser just for two fields.
     const hostMatch = raw.match(/^(?!\s*#)\s*host:\s*(.+)$/m);
     const portMatch = raw.match(/^(?!\s*#)\s*httpPort:\s*(\d+)/m);
@@ -182,7 +177,7 @@ async function stopKernel(home: string): Promise<boolean> {
   }
 
   console.log(`Stopping kernel (PID ${pid})...`);
-  process.kill(pid, "SIGTERM");
+  Deno.kill(pid, "SIGTERM");
 
   // Poll for exit — up to 5 seconds at 100ms intervals
   for (let i = 0; i < 50; i++) {
@@ -197,7 +192,7 @@ async function stopKernel(home: string): Promise<boolean> {
   // Force kill
   console.log("Kernel did not exit in time, sending SIGKILL...");
   try {
-    process.kill(pid, "SIGKILL");
+    Deno.kill(pid, "SIGKILL");
   } catch {
     // already gone
   }
@@ -222,31 +217,45 @@ function spawnDetached(home: string, logLevel?: string): void {
   }
 
   const logsDir = join(runtimeDir(home), "logs");
-  if (!existsSync(logsDir)) mkdirSync(logsDir, { recursive: true });
-  const outFd = openSync(join(logsDir, `kernel-${todayStamp()}.log`), "a");
+  if (!existsSync(logsDir)) Deno.mkdirSync(logsDir, { recursive: true });
 
-  const child = spawn("deno", args, {
-    stdio: ["ignore", outFd, outFd],
-    detached: true,
+  const logFilePath = join(logsDir, `kernel-${todayStamp()}.log`);
+
+  const cmd = new Deno.Command(Deno.execPath(), {
+    args,
+    stdin: "null",
+    stdout: "piped",
+    stderr: "piped",
     env: { ...Deno.env.toObject(), PONS_HOME: home },
   });
 
-  child.once("error", (err) => {
-    console.error(`Failed to spawn kernel: ${err.message}`);
+  let child: Deno.ChildProcess;
+  try {
+    child = cmd.spawn();
+  } catch (err) {
+    console.error(`Failed to spawn kernel: ${err instanceof Error ? err.message : String(err)}`);
     removePid(home);
-    process.exitCode = 1;
-  });
-
-  child.unref();
-
-  const pid = child.pid;
-  if (pid === undefined) {
-    console.error("Failed to spawn kernel process.");
-    process.exitCode = 1;
+    Deno.exitCode = 1;
     return;
   }
+
+  const pid = child.pid;
   writePid(home, pid);
   console.log(`Kernel started in background (PID ${pid}).`);
+
+  // Pipe stdout+stderr to log file asynchronously (fire-and-forget)
+  const pipeToLog = async (stream: ReadableStream<Uint8Array>) => {
+    const logFile = await Deno.open(logFilePath, { write: true, create: true, append: true });
+    try {
+      await stream.pipeTo(logFile.writable);
+    } catch { /* ignore */ }
+  };
+  pipeToLog(child.stdout).catch(() => {});
+  pipeToLog(child.stderr).catch(() => {});
+
+  // Detach: don't await the child's status
+  child.status.then(() => {}).catch(() => {});
+  child.unref();
 }
 
 async function startForeground(logLevel?: string): Promise<never> {
@@ -255,8 +264,8 @@ async function startForeground(logLevel?: string): Promise<never> {
   await kernel.boot();
   await kernel.start();
   // Kernel registers its own SIGINT/SIGTERM handlers and writes its own PID file.
-  // Block forever so the CLI's parseAsync never resolves and process.exit is not called.
-  // The kernel's shutdown() sets process.exitCode and the process exits when the event loop drains.
+  // Block forever so the CLI's parseAsync never resolves and Deno.exit is not called.
+  // The kernel's shutdown() sets Deno.exitCode and the process exits when the event loop drains.
   return new Promise(() => {});
 }
 
@@ -287,7 +296,7 @@ export function init(program: Command): void {
           console.error(
             `Kernel is already running (PID ${existingPid}). Use --force to replace it.`,
           );
-          process.exit(1);
+          Deno.exit(1);
         }
       } else if (existingPid !== null) {
         // Stale PID file
@@ -390,15 +399,19 @@ export function init(program: Command): void {
 
       // --list: show available log files
       if (opts.list) {
-        const files = readdirSync(logsDir)
-          .filter((f) => f.startsWith("kernel-") && f.endsWith(".log"))
-          .sort();
+        const files: string[] = [];
+        for (const entry of Deno.readDirSync(logsDir)) {
+          if (entry.name.startsWith("kernel-") && entry.name.endsWith(".log")) {
+            files.push(entry.name);
+          }
+        }
+        files.sort();
         if (files.length === 0) {
           console.log("No log files found.");
         } else {
           for (const f of files) {
-            const stat = statSync(join(logsDir, f));
-            const sizeKb = (stat.size / 1024).toFixed(1);
+            const stat = Deno.statSync(join(logsDir, f));
+            const sizeKb = ((stat.size ?? 0) / 1024).toFixed(1);
             console.log(`  ${f}  (${sizeKb} KB)`);
           }
         }
@@ -416,35 +429,37 @@ export function init(program: Command): void {
       }
 
       const lineCount = parseInt(opts.lines, 10) || 50;
+      const encoder = new TextEncoder();
 
       // Read existing content — show last N lines
-      const content = readFileSync(logFile, "utf-8");
+      const content = Deno.readTextFileSync(logFile);
       const lines = content.split("\n");
       const tail = lines.slice(-lineCount - 1).join("\n");
       if (tail.trim()) {
-        process.stdout.write(tail);
-        if (!tail.endsWith("\n")) process.stdout.write("\n");
+        Deno.stdout.writeSync(encoder.encode(tail));
+        if (!tail.endsWith("\n")) Deno.stdout.writeSync(encoder.encode("\n"));
       }
 
       // If viewing today's log, follow new output
       if (!opts.date || opts.date === todayStamp()) {
-        const fh = await open(logFile, "r");
+        const fh = await Deno.open(logFile, { read: true });
         let offset = (await fh.stat()).size;
 
         const poll = setInterval(async () => {
           const stat = await fh.stat();
           if (stat.size > offset) {
-            const buf = Buffer.alloc(stat.size - offset);
-            await fh.read(buf, 0, buf.length, offset);
-            process.stdout.write(buf.toString("utf-8"));
+            const buf = new Uint8Array(stat.size - offset);
+            await fh.seek(offset, Deno.SeekMode.Start);
+            await fh.read(buf);
+            Deno.stdout.writeSync(buf);
             offset = stat.size;
           }
         }, 200);
 
-        process.once("SIGINT", async () => {
+        Deno.addSignalListener("SIGINT", () => {
           clearInterval(poll);
-          await fh.close();
-          process.exit(0);
+          fh.close();
+          Deno.exit(0);
         });
 
         // Keep alive
@@ -493,18 +508,18 @@ export function init(program: Command): void {
         linked: boolean;
       }> = [];
 
-      for (const entry of readdirSync(modulesDir)) {
-        const modDir = join(modulesDir, entry);
-        const stat = lstatSync(modDir);
-        if (!stat.isDirectory() && !stat.isSymbolicLink()) continue;
+      for (const entry of Deno.readDirSync(modulesDir)) {
+        const modDir = join(modulesDir, entry.name);
+        const stat = Deno.lstatSync(modDir);
+        if (!stat.isDirectory && !stat.isSymlink) continue;
         const manifestPath = join(modDir, "module.json");
         if (!existsSync(manifestPath)) continue;
 
         try {
           const manifest: ModuleManifest = JSON.parse(
-            readFileSync(manifestPath, "utf-8"),
+            Deno.readTextFileSync(manifestPath),
           );
-          const linked = stat.isSymbolicLink();
+          const linked = stat.isSymlink;
 
           // Resolve version from deno.json
           let version = manifest.version;
@@ -512,7 +527,7 @@ export function init(program: Command): void {
             const denoJsonPath = join(modDir, "deno.json");
             if (existsSync(denoJsonPath)) {
               try {
-                const denoJson = JSON.parse(readFileSync(denoJsonPath, "utf-8"));
+                const denoJson = JSON.parse(Deno.readTextFileSync(denoJsonPath));
                 version = denoJson.version;
               } catch { /* ignore */ }
             }
@@ -564,12 +579,79 @@ export function init(program: Command): void {
 
       const success = await installModule(moduleName, opts.home, opts.yes);
 
+      // Notify running kernel to discover and spawn the new module
+      if (success) {
+        const home = opts.home || getPonsHome();
+        const pid = readPid(home);
+        if (pid !== null && isProcessRunning(pid)) {
+          try { Deno.kill(pid, "SIGHUP"); } catch { /* kernel may be gone */ }
+        }
+      }
+
       if (json) {
         outputJson({ module: moduleName, installed: success });
       }
 
       if (!success) {
-        process.exitCode = 1;
+        Deno.exitCode = 1;
+      }
+    });
+
+  /* ---- modules approve <module> ---- */
+  modules
+    .command("approve <module>")
+    .description("Approve permissions for a module that was added without install")
+    .option("--home <path>", "Override PONS_HOME directory")
+    .option("-y, --yes", "Auto-approve permissions")
+    .action(async (moduleName: string, opts: { home?: string; yes?: boolean }) => {
+      const home = opts.home || getPonsHome();
+      const modulesDir = join(home, "modules");
+      const moduleDir = join(modulesDir, moduleName);
+
+      if (!existsSync(moduleDir)) {
+        printError(`Module "${moduleName}" not found in ${modulesDir}`);
+        Deno.exitCode = 1;
+        return;
+      }
+
+      const manifestPath = join(moduleDir, "module.json");
+      if (!existsSync(manifestPath)) {
+        printError(`No module.json found in ${moduleDir}`);
+        Deno.exitCode = 1;
+        return;
+      }
+
+      let manifest: ModuleManifest;
+      try {
+        manifest = JSON.parse(Deno.readTextFileSync(manifestPath)) as ModuleManifest;
+      } catch {
+        printError(`Failed to parse module.json at ${manifestPath}`);
+        Deno.exitCode = 1;
+        return;
+      }
+
+      const store = new PermissionStore(home);
+
+      if (store.isApproved(manifest.id)) {
+        console.log(chalk.dim(`Module "${manifest.id}" is already approved.`));
+        return;
+      }
+
+      const approved = await displayAndApprovePermissions(manifest, manifestPath, store, opts.yes);
+
+      if (!approved) {
+        console.log(chalk.yellow("  Approval cancelled."));
+        Deno.exitCode = 1;
+        return;
+      }
+
+      console.log(chalk.green(`  Module "${manifest.id}" approved.`));
+
+      // Notify running kernel to discover and spawn the module
+      const pid = readPid(home);
+      if (pid !== null && isProcessRunning(pid)) {
+        try { Deno.kill(pid, "SIGHUP"); } catch { /* kernel may be gone */ }
+        console.log(chalk.dim("  Kernel notified — module will be spawned."));
       }
     });
 
@@ -595,7 +677,7 @@ export function init(program: Command): void {
         } else {
           printError(`Module "${moduleName}" is not installed.`);
         }
-        process.exitCode = 1;
+        Deno.exitCode = 1;
         return;
       }
 
@@ -605,7 +687,7 @@ export function init(program: Command): void {
       if (existsSync(manifestPath)) {
         try {
           manifest = JSON.parse(
-            readFileSync(manifestPath, "utf-8"),
+            Deno.readTextFileSync(manifestPath),
           ) as ModuleManifest;
         } catch {
           // Proceed without manifest data
@@ -632,7 +714,7 @@ export function init(program: Command): void {
       const spinner = ora(`Removing module "${moduleName}"...`).start();
 
       try {
-        rmSync(moduleDir, { recursive: true, force: true });
+        Deno.removeSync(moduleDir, { recursive: true });
 
         // Security: revoke permissions on uninstall
         const store = new PermissionStore(home);
@@ -642,7 +724,7 @@ export function init(program: Command): void {
         // Signal kernel to reload permissions if running
         const pid = readPid(home);
         if (pid !== null && isProcessRunning(pid)) {
-          try { process.kill(pid, "SIGUSR2"); } catch { /* kernel may be gone */ }
+          try { Deno.kill(pid, "SIGUSR2"); } catch { /* kernel may be gone */ }
         }
 
         spinner.succeed(`Uninstalled ${chalk.green(moduleName)}`);
@@ -660,7 +742,7 @@ export function init(program: Command): void {
             error: String(error),
           });
         }
-        process.exitCode = 1;
+        Deno.exitCode = 1;
       }
     });
 
@@ -682,7 +764,7 @@ export function init(program: Command): void {
         } else {
           printError("No modules directory found. Nothing to update.");
         }
-        process.exitCode = 1;
+        Deno.exitCode = 1;
         return;
       }
 
@@ -705,7 +787,7 @@ export function init(program: Command): void {
             "Specify a module name or use --all to update all modules.",
           );
         }
-        process.exitCode = 1;
+        Deno.exitCode = 1;
         return;
       }
 
@@ -719,9 +801,7 @@ export function init(program: Command): void {
         return;
       }
 
-      const { execSync } = await import("node:child_process");
-      const results: Array<{ id: string; updated: boolean; error?: string }> =
-        [];
+      const results: Array<{ id: string; updated: boolean; error?: string }> = [];
 
       for (const id of moduleIds) {
         const moduleDir = join(modulesDir, id);
@@ -734,7 +814,7 @@ export function init(program: Command): void {
 
         // Skip symlinked (local) modules -- they are managed by the developer
         try {
-          const stat = statSync(moduleDir, { throwIfNoEntry: false });
+          const stat = Deno.statSync(moduleDir);
           if (!stat) {
             results.push({ id, updated: false, error: "not found" });
             continue;
@@ -764,10 +844,16 @@ export function init(program: Command): void {
         const spinner = ora(`Updating "${id}" from git...`).start();
 
         try {
-          execSync("git pull", {
+          const gitCmd = new Deno.Command("git", {
+            args: ["pull"],
             cwd: moduleDir,
-            stdio: "pipe",
+            stdout: "piped",
+            stderr: "piped",
           });
+          const gitResult = await gitCmd.output();
+          if (!gitResult.success) {
+            throw new Error(new TextDecoder().decode(gitResult.stderr));
+          }
 
           spinner.succeed(`Updated ${chalk.green(id)}`);
           results.push({ id, updated: true });
@@ -821,7 +907,7 @@ export function init(program: Command): void {
           } else {
             printError(`No permissions found for module "${moduleName}".`);
           }
-          process.exitCode = 1;
+          Deno.exitCode = 1;
           return;
         }
 
@@ -895,7 +981,7 @@ export function init(program: Command): void {
         } else {
           printError(`Failed to revoke permissions for "${moduleName}". Module may not have approved permissions.`);
         }
-        process.exitCode = 1;
+        Deno.exitCode = 1;
         return;
       }
 
@@ -910,7 +996,7 @@ export function init(program: Command): void {
       const pid = readPid(home);
       if (pid !== null && isProcessRunning(pid)) {
         try {
-          process.kill(pid, "SIGUSR2");
+          Deno.kill(pid, "SIGUSR2");
           console.log(chalk.dim("  Kernel notified — affected module will be restarted."));
         } catch {
           console.log(chalk.dim("  Could not signal kernel — restart manually for changes to take effect."));

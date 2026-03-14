@@ -151,7 +151,7 @@ class DenoChildProcessWrapper implements ChildProcessLike {
 
   on(event: 'message', handler: MessageHandler): void;
   on(event: 'exit', handler: ExitHandler): void;
-  on(event: string, handler: (...args: unknown[]) => void): void {
+  on(event: string, handler: MessageHandler | ExitHandler): void {
     if (event === 'message') this.messageHandlers.push(handler as MessageHandler);
     else if (event === 'exit') this.exitHandlers.push(handler as ExitHandler);
   }

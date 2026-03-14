@@ -212,6 +212,14 @@ export default class Kernel {
       }
     });
 
+    // Module hot-reload: CLI sends SIGHUP after installing/uninstalling modules
+    Deno.addSignalListener("SIGHUP", () => {
+      this.logger.info("Received SIGHUP — re-discovering modules");
+      this.reloadModules().catch((err) => {
+        this.logger.error({ error: String(err) }, "Failed to reload modules");
+      });
+    });
+
     this.logger.info("Kernel running");
 
     // Write PID file for CLI process management
@@ -220,6 +228,38 @@ export default class Kernel {
     Deno.writeTextFileSync(join(runtimeDir, "kernel.pid"), String(Deno.pid));
 
     return this;
+  }
+
+  /**
+   * Re-discover modules and spawn any newly installed ones.
+   * Existing running modules are left untouched.
+   */
+  private async reloadModules(): Promise<void> {
+    const freshModules = await this.moduleLoader.discover();
+    const runningIds = new Set(this.lifecycle.getRegistry().ids());
+
+    const newModules = freshModules.filter((m) => !runningIds.has(m.manifest.id));
+
+    if (newModules.length === 0) {
+      this.logger.info("No new modules found");
+      return;
+    }
+
+    // Re-discover config schemas for new modules
+    await this.configManager.discoverSchemas(
+      freshModules.map((m) => ({ manifest: m.manifest, moduleDir: m.moduleDir })),
+    );
+    this._config = this.configManager.load();
+
+    // Update lifecycle config reference
+    (this.lifecycle as unknown as { initPayload: { config: unknown } })
+      .initPayload.config = this._config;
+
+    this.logger.info({ modules: newModules.map((m) => m.manifest.id) }, "Spawning new modules");
+    await this.lifecycle.spawnAll(newModules);
+
+    // Update internal module list
+    this.modules = freshModules;
   }
 
   async shutdown(): Promise<void> {

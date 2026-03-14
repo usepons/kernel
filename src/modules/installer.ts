@@ -73,7 +73,7 @@ function extractModuleName(nameOrUrl: string): string {
  * Display module permissions and ask the user for approval.
  * Returns true if approved, false if rejected.
  */
-async function displayAndApprovePermissions(
+export async function displayAndApprovePermissions(
   manifest: ModuleManifest,
   manifestPath: string,
   permissionStore: PermissionStore,
@@ -288,7 +288,7 @@ export async function installModule(
     const spinner = ora(`Linking local module "${manifest.id}"...`).start();
 
     try {
-      Deno.symlinkSync(localPath, targetDir, "dir");
+      Deno.symlinkSync(localPath, targetDir, { type: "dir" });
       spinner.succeed(
         `Linked ${chalk.green(manifest.id)} from ${chalk.dim(localPath)}`,
       );

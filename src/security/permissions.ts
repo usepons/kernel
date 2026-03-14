@@ -8,6 +8,7 @@
 
 import { dirname, join } from 'jsr:@std/path';
 import { encodeHex } from 'jsr:@std/encoding/hex';
+import { crypto as stdCrypto } from 'jsr:@std/crypto';
 import { z } from 'npm:zod@^3.24';
 import { parse as parseYaml, stringify as stringifyYaml } from 'npm:yaml@^2.7.1';
 import { getPonsHome } from 'jsr:@pons/sdk@^0.2';
@@ -112,14 +113,8 @@ export function translateToDenoFlags(permissions: ModulePermissions): string[] {
 export function computeManifestHash(manifestPath: string): string {
   const content = Deno.readTextFileSync(manifestPath);
   const data = new TextEncoder().encode(content);
-  // Use @std/crypto's synchronous digestSync
-  const hash = crypto.subtle as unknown as { digestSync?: (algo: string, data: Uint8Array) => ArrayBuffer };
-  if (hash.digestSync) {
-    return encodeHex(new Uint8Array(hash.digestSync("SHA-256", data)));
-  }
-  // Fallback: use Deno's built-in synchronous crypto (available via @std/crypto)
-  // Run sync hash via synchronous XOR-based stub is not viable; throw to force fix
-  throw new Error("computeManifestHash: digestSync not available — upgrade to @std/crypto");
+  const hash = stdCrypto.subtle.digestSync("SHA-256", data);
+  return encodeHex(new Uint8Array(hash));
 }
 
 // ─── Permission Store ───────────────────────────────────────────
@@ -140,14 +135,14 @@ export class PermissionStore {
   }
 
   private load(): void {
-    if (!existsSync(this.filePath)) {
+    try { Deno.statSync(this.filePath); } catch {
       this.data = {};
       this.serviceProviders = {};
       return;
     }
 
     try {
-      const raw = readFileSync(this.filePath, 'utf-8');
+      const raw = Deno.readTextFileSync(this.filePath);
       const parsed = parseYaml(raw) as { modules?: Record<string, GrantedPermission>; serviceProviders?: Record<string, string> } | null;
       this.data = parsed?.modules ?? {};
       this.serviceProviders = parsed?.serviceProviders ?? {};
@@ -159,14 +154,12 @@ export class PermissionStore {
 
   private save(): void {
     const dir = dirname(this.filePath);
-    if (!existsSync(dir)) {
-      mkdirSync(dir, { recursive: true });
-    }
+    try { Deno.statSync(dir); } catch { Deno.mkdirSync(dir, { recursive: true }); }
     const content = stringifyYaml({
       modules: this.data,
       serviceProviders: this.serviceProviders,
     });
-    writeFileSync(this.filePath, content, 'utf-8');
+    Deno.writeTextFileSync(this.filePath, content);
   }
 
   /**
