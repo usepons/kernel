@@ -110,8 +110,16 @@ export function translateToDenoFlags(permissions: ModulePermissions): string[] {
  * Compute SHA-256 hash of a module.json file for tamper detection.
  */
 export function computeManifestHash(manifestPath: string): string {
-  const content = readFileSync(manifestPath, 'utf-8');
-  return createHash('sha256').update(content).digest('hex');
+  const content = Deno.readTextFileSync(manifestPath);
+  const data = new TextEncoder().encode(content);
+  // Use @std/crypto's synchronous digestSync
+  const hash = crypto.subtle as unknown as { digestSync?: (algo: string, data: Uint8Array) => ArrayBuffer };
+  if (hash.digestSync) {
+    return encodeHex(new Uint8Array(hash.digestSync("SHA-256", data)));
+  }
+  // Fallback: use Deno's built-in synchronous crypto (available via @std/crypto)
+  // Run sync hash via synchronous XOR-based stub is not viable; throw to force fix
+  throw new Error("computeManifestHash: digestSync not available — upgrade to @std/crypto");
 }
 
 // ─── Permission Store ───────────────────────────────────────────
