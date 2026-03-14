@@ -6,8 +6,7 @@
  * ready to be spawned by the LifecycleManager.
  */
 
-import { join } from 'node:path';
-import { existsSync, readdirSync, statSync, readFileSync } from 'node:fs';
+import { join } from 'jsr:@std/path';
 import type { ModuleManifest } from 'jsr:@pons/sdk@^0.2';
 import { createLogger, type KernelLogger } from '../logs/logger.ts';
 import { modulePermissionsSchema, computeManifestHash } from '../security/permissions.ts';
@@ -28,7 +27,7 @@ export class ModuleLoader {
   }
 
   discover(): DiscoveredModule[] {
-    if (!existsSync(this.modulesDir)) {
+    try { Deno.statSync(this.modulesDir); } catch {
       this.logger.warn({ modulesDir: this.modulesDir }, 'No modules directory found — nothing to discover');
       return [];
     }
@@ -36,22 +35,22 @@ export class ModuleLoader {
     this.logger.info({ modulesDir: this.modulesDir }, 'Scanning modules directory');
     const discovered: DiscoveredModule[] = [];
 
-    for (const entry of readdirSync(this.modulesDir)) {
-      const moduleDir = join(this.modulesDir, entry);
+    for (const entry of Deno.readDirSync(this.modulesDir)) {
+      const moduleDir = join(this.modulesDir, entry.name);
 
       try {
-        if (!statSync(moduleDir).isDirectory()) continue;
+        if (!Deno.statSync(moduleDir).isDirectory) continue;
       } catch {
         this.logger.debug({ path: moduleDir }, 'Cannot stat entry — skipping');
         continue;
       }
 
       const manifestPath = join(moduleDir, 'module.json');
-      if (!existsSync(manifestPath)) continue;
+      try { Deno.statSync(manifestPath); } catch { continue; }
 
       let manifest: ModuleManifest;
       try {
-        manifest = JSON.parse(readFileSync(manifestPath, 'utf-8'));
+        manifest = JSON.parse(Deno.readTextFileSync(manifestPath));
       } catch (err) {
         this.logger.warn({ path: manifestPath, error: String(err) }, 'Failed to parse module.json — skipping');
         continue;
@@ -90,17 +89,20 @@ export class ModuleLoader {
 
       // Resolve version from deno.json in the module directory
       const denoJsonPath = join(moduleDir, 'deno.json');
-      if (existsSync(denoJsonPath)) {
+      try {
+        Deno.statSync(denoJsonPath);
         try {
-          const denoJson = JSON.parse(readFileSync(denoJsonPath, 'utf-8'));
+          const denoJson = JSON.parse(Deno.readTextFileSync(denoJsonPath));
           if (denoJson.version) manifest.version = denoJson.version;
         } catch { /* ignore parse errors */ }
-      }
+      } catch { /* deno.json not present */ }
 
       const entrypoint = manifest.entrypoint || 'runner.ts';
       const entryJs = join(moduleDir, entrypoint.replace(/\.ts$/, '.js'));
       const entryTs = join(moduleDir, entrypoint);
-      const runnerPath = existsSync(entryJs) ? entryJs : existsSync(entryTs) ? entryTs : null;
+      const entryJsExists = (() => { try { Deno.statSync(entryJs); return true; } catch { return false; } })();
+      const entryTsExists = (() => { try { Deno.statSync(entryTs); return true; } catch { return false; } })();
+      const runnerPath = entryJsExists ? entryJs : entryTsExists ? entryTs : null;
 
       if (!runnerPath) {
         this.logger.warn({ module: manifest.id, entrypoint }, 'Entry point not found — skipping');

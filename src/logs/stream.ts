@@ -103,7 +103,8 @@ export interface LogStreamOptions {
 
 export function createLogStream(opts: LogStreamOptions = {}): Writable {
   const color = opts.colorize ?? true;
-  const write = opts.output ?? ((data: string) => process.stdout.write(data));
+  const encoder = new TextEncoder();
+  const write = opts.output ?? ((data: string) => Deno.stdout.writeSync(encoder.encode(data)));
 
   // ─── Auto-grouping buffer ──────────────────────────────────
   let currentGroup: {

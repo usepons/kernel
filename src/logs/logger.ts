@@ -6,8 +6,7 @@
  */
 
 import pino from 'npm:pino@^10.3.1';
-import { createWriteStream, mkdirSync } from 'node:fs';
-import { join } from 'node:path';
+import { join } from 'jsr:@std/path';
 import type { LoggingConfig } from '../config/types.ts';
 import { createLogStream } from './stream.ts';
 import { formatInline } from './utils.ts';
@@ -28,19 +27,20 @@ function todayStamp(): string {
 }
 
 function createDailyFileOutput(logDir: string): (data: string) => void {
-  mkdirSync(logDir, { recursive: true });
+  Deno.mkdirSync(logDir, { recursive: true });
 
   let currentDate = todayStamp();
-  let fileStream = createWriteStream(join(logDir, `kernel-${currentDate}.log`), { flags: 'a' });
+  let fileHandle = Deno.openSync(join(logDir, `kernel-${currentDate}.log`), { write: true, create: true, append: true });
+  const encoder = new TextEncoder();
 
   return (data: string) => {
     const now = todayStamp();
     if (now !== currentDate) {
-      fileStream.end();
+      fileHandle.close();
       currentDate = now;
-      fileStream = createWriteStream(join(logDir, `kernel-${currentDate}.log`), { flags: 'a' });
+      fileHandle = Deno.openSync(join(logDir, `kernel-${currentDate}.log`), { write: true, create: true, append: true });
     }
-    fileStream.write(data);
+    fileHandle.writeSync(encoder.encode(data));
   };
 }
 

@@ -6,9 +6,8 @@
  * permissions in ~/.pons/permissions.yaml.
  */
 
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
-import { createHash } from 'node:crypto';
-import { dirname, join } from 'node:path';
+import { dirname, join } from 'jsr:@std/path';
+import { encodeHex } from 'jsr:@std/encoding/hex';
 import { z } from 'npm:zod@^3.24';
 import { parse as parseYaml, stringify as stringifyYaml } from 'npm:yaml@^2.7.1';
 import { getPonsHome } from 'jsr:@pons/sdk@^0.2';

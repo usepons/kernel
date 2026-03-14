@@ -7,18 +7,7 @@
  * Also supports local paths and git URLs for development.
  */
 
-import { execFileSync } from "node:child_process";
-import {
-  existsSync,
-  lstatSync,
-  mkdirSync,
-  readdirSync,
-  readFileSync,
-  rmSync,
-  symlinkSync,
-  writeFileSync,
-} from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, resolve } from "jsr:@std/path";
 import ora from "npm:ora@^8.2.0";
 import chalk from "npm:chalk@^5.6.2";
 import { getPonsHome } from "jsr:@pons/sdk@^0.2";
@@ -47,19 +36,18 @@ interface JsrVersionMeta {
  * Scan a modules directory for installed modules with valid module.json manifests.
  */
 export function getInstalledModules(modulesDir: string): ModuleManifest[] {
-  if (!existsSync(modulesDir)) return [];
+  try { Deno.statSync(modulesDir); } catch { return []; }
 
   const manifests: ModuleManifest[] = [];
 
-  const entries = readdirSync(modulesDir, { withFileTypes: true });
-  for (const entry of entries) {
-    if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
+  for (const entry of Deno.readDirSync(modulesDir)) {
+    if (!entry.isDirectory && !entry.isSymlink) continue;
 
     const manifestPath = join(modulesDir, entry.name, "module.json");
-    if (!existsSync(manifestPath)) continue;
+    try { Deno.statSync(manifestPath); } catch { continue; }
 
     try {
-      const raw = readFileSync(manifestPath, "utf-8");
+      const raw = Deno.readTextFileSync(manifestPath);
       const manifest = JSON.parse(raw) as ModuleManifest;
       manifests.push(manifest);
     } catch {
@@ -220,11 +208,9 @@ async function downloadPackageFiles(
     const localPath = join(targetDir, filePath);
     const dir = dirname(localPath);
 
-    if (!existsSync(dir)) {
-      mkdirSync(dir, { recursive: true });
-    }
+    try { Deno.statSync(dir); } catch { Deno.mkdirSync(dir, { recursive: true }); }
 
-    writeFileSync(localPath, content, "utf-8");
+    Deno.writeTextFileSync(localPath, content);
     downloaded++;
     onProgress?.(downloaded, filePaths.length);
   }
@@ -235,12 +221,12 @@ async function downloadPackageFiles(
  */
 function stampModuleVersion(targetDir: string, version: string): void {
   const manifestPath = join(targetDir, "module.json");
-  if (!existsSync(manifestPath)) return;
+  try { Deno.statSync(manifestPath); } catch { return; }
 
   try {
-    const manifest = JSON.parse(readFileSync(manifestPath, "utf-8"));
+    const manifest = JSON.parse(Deno.readTextFileSync(manifestPath));
     manifest.version = version;
-    writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + "\n", "utf-8");
+    Deno.writeTextFileSync(manifestPath, JSON.stringify(manifest, null, 2) + "\n");
   } catch { /* best effort */ }
 }
 
@@ -268,9 +254,7 @@ export async function installModule(
   const permStore = new PermissionStore(home);
 
   // Ensure modules directory exists
-  if (!existsSync(modulesDir)) {
-    mkdirSync(modulesDir, { recursive: true });
-  }
+  try { Deno.statSync(modulesDir); } catch { Deno.mkdirSync(modulesDir, { recursive: true }); }
 
   // --- Local path ---
   if (
@@ -280,16 +264,14 @@ export async function installModule(
     const localPath = resolve(nameOrUrl);
     const manifestPath = join(localPath, "module.json");
 
-    if (!existsSync(manifestPath)) {
+    try { Deno.statSync(manifestPath); } catch {
       printError(`No module.json found at ${localPath}`);
       return false;
     }
 
     let manifest: ModuleManifest;
     try {
-      manifest = JSON.parse(
-        readFileSync(manifestPath, "utf-8"),
-      ) as ModuleManifest;
+      manifest = JSON.parse(Deno.readTextFileSync(manifestPath)) as ModuleManifest;
     } catch {
       printError(`Failed to parse module.json at ${manifestPath}`);
       return false;
@@ -297,15 +279,16 @@ export async function installModule(
 
     const targetDir = join(modulesDir, manifest.id);
 
-    if (existsSync(targetDir)) {
+    try {
+      Deno.statSync(targetDir);
       printWarning(`Module "${manifest.id}" is already installed. Skipping.`);
       return true;
-    }
+    } catch { /* not installed yet */ }
 
     const spinner = ora(`Linking local module "${manifest.id}"...`).start();
 
     try {
-      symlinkSync(localPath, targetDir, "dir");
+      Deno.symlinkSync(localPath, targetDir, "dir");
       spinner.succeed(
         `Linked ${chalk.green(manifest.id)} from ${chalk.dim(localPath)}`,
       );
@@ -315,7 +298,7 @@ export async function installModule(
       const approved = await displayAndApprovePermissions(manifest, manifestPath, store, autoApprove);
       if (!approved) {
         // Clean up the symlink
-        rmSync(targetDir, { force: true });
+        Deno.removeSync(targetDir);
         console.log(chalk.yellow('  Installation cancelled — permissions rejected.'));
         return false;
       }
@@ -333,34 +316,37 @@ export async function installModule(
     const moduleName = extractModuleName(nameOrUrl);
     const targetDir = join(modulesDir, moduleName);
 
-    if (existsSync(targetDir)) {
+    try {
+      Deno.statSync(targetDir);
       printWarning(`Module "${moduleName}" is already installed. Skipping.`);
       return true;
-    }
+    } catch { /* not installed yet */ }
 
     const spinner = ora(`Cloning ${chalk.cyan(nameOrUrl)}...`).start();
 
     try {
-      execFileSync('git', ['clone', '--depth', '1', '--', nameOrUrl, targetDir], {
-        stdio: "pipe",
-      });
+      new Deno.Command('git', {
+        args: ['clone', '--depth', '1', '--', nameOrUrl, targetDir],
+        stdout: 'piped',
+        stderr: 'piped',
+      }).outputSync();
 
       // Validate module.json exists after clone
       const manifestPath = join(targetDir, "module.json");
-      if (!existsSync(manifestPath)) {
+      try { Deno.statSync(manifestPath); } catch {
         spinner.fail(`Cloned repository does not contain a module.json`);
-        rmSync(targetDir, { recursive: true, force: true });
+        Deno.removeSync(targetDir, { recursive: true });
         return false;
       }
 
       spinner.succeed(`Installed ${chalk.green(moduleName)} from git`);
 
       // Security: approve permissions
-      const manifest = JSON.parse(readFileSync(manifestPath, "utf-8")) as ModuleManifest;
+      const manifest = JSON.parse(Deno.readTextFileSync(manifestPath)) as ModuleManifest;
       const store = permStore;
       const approved = await displayAndApprovePermissions(manifest, manifestPath, store, autoApprove);
       if (!approved) {
-        rmSync(targetDir, { recursive: true, force: true });
+        Deno.removeSync(targetDir, { recursive: true });
         console.log(chalk.yellow('  Installation cancelled — permissions rejected.'));
         return false;
       }
@@ -369,9 +355,7 @@ export async function installModule(
     } catch (error) {
       spinner.fail(`Failed to install "${moduleName}" from git`);
       printError(error instanceof Error ? error.message : String(error));
-      if (existsSync(targetDir)) {
-        rmSync(targetDir, { recursive: true, force: true });
-      }
+      try { Deno.statSync(targetDir); Deno.removeSync(targetDir, { recursive: true }); } catch { /* ignore */ }
       return false;
     }
   }
@@ -390,10 +374,11 @@ export async function installModule(
   const jsrPackage = `module-${moduleName}`;
   const targetDir = join(modulesDir, moduleName);
 
-  if (existsSync(targetDir)) {
+  try {
+    Deno.statSync(targetDir);
     printWarning(`Module "${moduleName}" is already installed. Skipping.`);
     return false;
-  }
+  } catch { /* not installed yet */ }
 
   const spinner = ora(`Resolving ${chalk.cyan(`@${JSR_SCOPE}/${jsrPackage}`)} on JSR...`).start();
 
@@ -406,7 +391,7 @@ export async function installModule(
 
     spinner.text = `Downloading ${chalk.cyan(moduleName)} v${version} (${fileCount} files)...`;
 
-    mkdirSync(targetDir, { recursive: true });
+    Deno.mkdirSync(targetDir, { recursive: true });
 
     await downloadPackageFiles(jsrPackage, version, versionMeta, targetDir, (current, total) => {
       spinner.text = `Downloading ${chalk.cyan(moduleName)} v${version} (${current}/${total} files)...`;
@@ -417,16 +402,14 @@ export async function installModule(
 
     // Validate module.json
     const manifestPath = join(targetDir, "module.json");
-    if (!existsSync(manifestPath)) {
+    try { Deno.statSync(manifestPath); } catch {
       spinner.fail(`Package @${JSR_SCOPE}/${jsrPackage} does not contain a module.json`);
-      rmSync(targetDir, { recursive: true, force: true });
+      Deno.removeSync(targetDir, { recursive: true });
       return false;
     }
 
     // Check requires — warn about missing services
-    const manifest = JSON.parse(
-      readFileSync(manifestPath, "utf-8"),
-    ) as ModuleManifest;
+    const manifest = JSON.parse(Deno.readTextFileSync(manifestPath)) as ModuleManifest;
     if (manifest.requires && manifest.requires.length > 0) {
       const installed = getInstalledModules(modulesDir);
       const providedServices = new Set(
@@ -453,7 +436,7 @@ export async function installModule(
     const store = permStore;
     const approved = await displayAndApprovePermissions(manifest, manifestPath, store, autoApprove);
     if (!approved) {
-      rmSync(targetDir, { recursive: true, force: true });
+      Deno.removeSync(targetDir, { recursive: true });
       console.log(chalk.yellow('  Installation cancelled — permissions rejected.'));
       return false;
     }
@@ -462,9 +445,7 @@ export async function installModule(
   } catch (error) {
     spinner.fail(`Failed to install "${moduleName}" from JSR`);
     printError(error instanceof Error ? error.message : String(error));
-    if (existsSync(targetDir)) {
-      rmSync(targetDir, { recursive: true, force: true });
-    }
+    try { Deno.statSync(targetDir); Deno.removeSync(targetDir, { recursive: true }); } catch { /* ignore */ }
     return false;
   }
 }
@@ -487,11 +468,11 @@ export interface UpdateResult {
  */
 export function detectInstallSource(moduleDir: string): "symlink" | "git" | "jsr" {
   try {
-    const stat = lstatSync(moduleDir);
-    if (stat.isSymbolicLink()) return "symlink";
+    const stat = Deno.lstatSync(moduleDir);
+    if (stat.isSymlink) return "symlink";
   } catch { /* not a symlink */ }
 
-  if (existsSync(join(moduleDir, ".git"))) return "git";
+  try { Deno.statSync(join(moduleDir, ".git")); return "git"; } catch { /* not git */ }
   return "jsr";
 }
 
@@ -502,9 +483,9 @@ function readInstalledVersion(moduleDir: string): string | undefined {
   // Try deno.json first (JSR packages always have it)
   for (const file of ["deno.json", "module.json"]) {
     const path = join(moduleDir, file);
-    if (!existsSync(path)) continue;
     try {
-      const json = JSON.parse(readFileSync(path, "utf-8"));
+      Deno.statSync(path);
+      const json = JSON.parse(Deno.readTextFileSync(path));
       if (json.version) return json.version;
     } catch { /* skip */ }
   }
@@ -540,8 +521,8 @@ export async function updateModuleFromJsr(
     const versionMeta = await fetchVersionManifest(jsrPackage, latestVersion);
 
     // Remove old files and re-download
-    rmSync(moduleDir, { recursive: true, force: true });
-    mkdirSync(moduleDir, { recursive: true });
+    Deno.removeSync(moduleDir, { recursive: true });
+    Deno.mkdirSync(moduleDir, { recursive: true });
 
     await downloadPackageFiles(jsrPackage, latestVersion, versionMeta, moduleDir, (current, total) => {
       spinner.text = `Downloading ${chalk.cyan(moduleName)} v${latestVersion} (${current}/${total} files)...`;

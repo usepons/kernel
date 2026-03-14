@@ -9,16 +9,13 @@
  *   2. RPC — direct IPC routing (non-persistent, exactly-once, timeout on failure)
  */
 
-import { fork, spawn as spawnChild } from 'node:child_process';
-import { Buffer } from 'node:buffer';
-import { randomUUID } from 'node:crypto';
-import { existsSync } from 'node:fs';
+import { dirname, join } from 'jsr:@std/path';
 import type { DiscoveredModule } from './module/loader.ts';
-import { dirname, join } from 'node:path';
 import type { KernelLogger } from './logs/logger.ts';
 import { writeModuleLog, writeModuleLogGroup } from './logs/logger.ts';
 import type { MessageBus } from './messaging/bus.ts';
 import { ModuleRegistry } from './module/registry.ts';
+import type { ChildProcessLike } from './module/registry.ts';
 import type { KernelMessage, ModuleMessage, ModuleManifest } from 'jsr:@pons/sdk@^0.2';
 import type { SecurityEnforcer } from './security/enforcer.ts';
 import { translateToDenoFlags } from './security/permissions.ts';
@@ -66,6 +63,152 @@ interface PendingRpc {
 interface PendingReady {
   manifest: ModuleManifest;
   timer: ReturnType<typeof setTimeout>;
+}
+
+// ─── Deno Child Process Wrapper ────────────────────────────────
+//
+// Wraps Deno.ChildProcess to provide a Node-like interface used by
+// the lifecycle manager: connected, send(), on('message'|'exit'), kill(), pid.
+// IPC is implemented as newline-delimited JSON over stdin/stdout.
+
+type MessageHandler = (msg: unknown) => void;
+type ExitHandler = (code: number | null, signal: string | null) => void;
+type DataHandler = (data: Uint8Array) => void;
+
+class DenoChildProcessWrapper implements ChildProcessLike {
+  readonly pid: number;
+  connected: boolean = true;
+
+  private messageHandlers: MessageHandler[] = [];
+  private exitHandlers: ExitHandler[] = [];
+  private stdoutHandlers: DataHandler[] = [];
+  private stderrHandlers: DataHandler[] = [];
+
+  private encoder = new TextEncoder();
+  private decoder = new TextDecoder();
+
+  private readonly _proc: Deno.ChildProcess;
+  private readonly _stdin: WritableStreamDefaultWriter<Uint8Array>;
+
+  constructor(proc: Deno.ChildProcess) {
+    this._proc = proc;
+    this.pid = proc.pid;
+    this._stdin = proc.stdin.getWriter();
+
+    // Read stdout lines as JSON IPC messages
+    this._readLines(proc.stdout, (line) => {
+      // Try to parse as IPC JSON first
+      try {
+        const msg = JSON.parse(line);
+        for (const h of this.messageHandlers) h(msg);
+      } catch {
+        // Not JSON — treat as plain stdout data
+        const data = this.encoder.encode(line + '\n');
+        for (const h of this.stdoutHandlers) h(data);
+      }
+    });
+
+    // Read stderr as plain data
+    this._readLines(proc.stderr, (line) => {
+      const data = this.encoder.encode(line + '\n');
+      for (const h of this.stderrHandlers) h(data);
+    });
+
+    // Watch for exit
+    proc.status.then((status) => {
+      this.connected = false;
+      const code = status.success ? 0 : (status.code ?? 1);
+      const signal = status.signal ?? null;
+      for (const h of this.exitHandlers) h(code, signal);
+    });
+  }
+
+  private async _readLines(
+    stream: ReadableStream<Uint8Array>,
+    onLine: (line: string) => void,
+  ): Promise<void> {
+    const reader = stream.getReader();
+    let buffer = '';
+    try {
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += this.decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() ?? '';
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (trimmed) onLine(trimmed);
+        }
+      }
+      if (buffer.trim()) onLine(buffer.trim());
+    } catch {
+      // Stream closed
+    } finally {
+      reader.releaseLock();
+    }
+  }
+
+  on(event: 'message', handler: MessageHandler): void;
+  on(event: 'exit', handler: ExitHandler): void;
+  on(event: string, handler: (...args: unknown[]) => void): void {
+    if (event === 'message') this.messageHandlers.push(handler as MessageHandler);
+    else if (event === 'exit') this.exitHandlers.push(handler as ExitHandler);
+  }
+
+  once(event: 'exit', handler: ExitHandler): void {
+    const wrapper: ExitHandler = (code, signal) => {
+      this.exitHandlers = this.exitHandlers.filter((h) => h !== wrapper);
+      handler(code, signal);
+    };
+    this.exitHandlers.push(wrapper);
+  }
+
+  get stdout() {
+    return {
+      on: (event: string, handler: DataHandler) => {
+        if (event === 'data') this.stdoutHandlers.push(handler);
+      },
+    };
+  }
+
+  get stderr() {
+    return {
+      on: (event: string, handler: DataHandler) => {
+        if (event === 'data') this.stderrHandlers.push(handler);
+      },
+    };
+  }
+
+  send(msg: unknown): void {
+    if (!this.connected) return;
+    const line = JSON.stringify(msg) + '\n';
+    const bytes = this.encoder.encode(line);
+    // Fire-and-forget write — errors mean the process is gone
+    this._stdin.write(bytes).catch(() => {
+      this.connected = false;
+    });
+  }
+
+  kill(signal: string = 'SIGTERM'): void {
+    try {
+      this._proc.kill(signal as Deno.Signal);
+    } catch {
+      // Process already exited
+    }
+    this.connected = false;
+  }
+}
+
+// ─── existsSync helper ──────────────────────────────────────────
+
+function existsSync(path: string): boolean {
+  try {
+    Deno.statSync(path);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 // ─── Lifecycle Manager ─────────────────────────────────────────
@@ -120,11 +263,11 @@ export class LifecycleManager {
 
     const proc = this.forkProcess(runnerPath, manifest, env);
 
-    proc.stdout?.on('data', (d: Buffer) => {
-      this.logger.debug({ module: manifest.id, source: 'stdout' }, d.toString().trim());
+    proc.stdout?.on('data', (d: Uint8Array) => {
+      this.logger.debug({ module: manifest.id, source: 'stdout' }, new TextDecoder().decode(d).trim());
     });
-    proc.stderr?.on('data', (d: Buffer) => {
-      this.logger.warn({ module: manifest.id, source: 'stderr' }, d.toString().trim());
+    proc.stderr?.on('data', (d: Uint8Array) => {
+      this.logger.warn({ module: manifest.id, source: 'stderr' }, new TextDecoder().decode(d).trim());
     });
 
     proc.on('message', (raw) => {
@@ -330,7 +473,7 @@ export class LifecycleManager {
       if (!entry?.process?.connected) continue;
       this.send(subscriberId, {
         type: 'deliver',
-        id: randomUUID(),
+        id: crypto.randomUUID(),
         topic,
         payload,
       });
@@ -484,7 +627,7 @@ export class LifecycleManager {
 
   private async ping(moduleId: string): Promise<void> {
     return new Promise((resolve, reject) => {
-      const id = `ping:${randomUUID()}`;
+      const id = `ping:${crypto.randomUUID()}`;
       const timer = setTimeout(() => {
         this.pendingCalls.get(moduleId)?.delete(id);
         reject(new Error('Ping timeout'));
@@ -499,7 +642,7 @@ export class LifecycleManager {
 
   call(moduleId: string, method: string, params?: unknown, timeoutMs = RPC_TIMEOUT_MS): Promise<unknown> {
     return new Promise((resolve, reject) => {
-      const id = randomUUID();
+      const id = crypto.randomUUID();
       const timer = setTimeout(() => {
         this.pendingCalls.get(moduleId)?.delete(id);
         reject(new Error(`Call ${method} timed out`));
@@ -612,26 +755,28 @@ export class LifecycleManager {
 
   // ─── Process Forking ─────────────────────────────────────────
 
-  private forkProcess(runnerPath: string, manifest: ModuleManifest, env?: Record<string, string>) {
-    const isDeno = typeof (globalThis as Record<string, unknown>).Deno !== 'undefined';
-    const childEnv = { ...process.env, NODE_PATH: process.env["NODE_PATH"] || "", ...env };
-    const stdio: ['pipe', 'pipe', 'pipe', 'ipc'] = ['pipe', 'pipe', 'pipe', 'ipc'];
+  private forkProcess(runnerPath: string, manifest: ModuleManifest, env?: Record<string, string>): DenoChildProcessWrapper {
+    const childEnv = { ...Deno.env.toObject(), ...env };
 
-    if (isDeno) {
-      // Security: translate manifest permissions to Deno flags (never --allow-all)
-      const denoPerms = manifest.permissions
-        ? translateToDenoFlags(manifest.permissions as ModulePermissions)
-        : ['--deny-all'];
-      // Prefer the module's own deno.json (needed for nodeModulesDir, import maps, etc.)
-      const moduleDenoConfig = join(dirname(runnerPath), 'deno.json');
-      const configPath = existsSync(moduleDenoConfig) ? moduleDenoConfig : this.denoConfigPath;
-      const denoArgs = configPath ? [`--config=${configPath}`] : [];
-      return spawnChild(process.execPath, ['run', ...denoPerms, '--unstable-sloppy-imports', ...denoArgs, runnerPath], {
-        stdio, env: childEnv,
-      });
-    }
+    // Security: translate manifest permissions to Deno flags (never --allow-all)
+    const denoPerms = manifest.permissions
+      ? translateToDenoFlags(manifest.permissions as ModulePermissions)
+      : ['--deny-all'];
+    // Prefer the module's own deno.json (needed for nodeModulesDir, import maps, etc.)
+    const moduleDenoConfig = join(dirname(runnerPath), 'deno.json');
+    const configPath = existsSync(moduleDenoConfig) ? moduleDenoConfig : this.denoConfigPath;
+    const denoArgs = configPath ? [`--config=${configPath}`] : [];
 
-    return fork(runnerPath, [], { stdio, env: childEnv });
+    const cmd = new Deno.Command(Deno.execPath(), {
+      args: ['run', ...denoPerms, '--unstable-sloppy-imports', ...denoArgs, runnerPath],
+      stdin: 'piped',
+      stdout: 'piped',
+      stderr: 'piped',
+      env: childEnv,
+    });
+
+    const proc = cmd.spawn();
+    return new DenoChildProcessWrapper(proc);
   }
 
   private findDenoConfig(): string | null {

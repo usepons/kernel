@@ -1,5 +1,4 @@
-import { dirname, join, resolve } from "node:path";
-import { mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { dirname, join, resolve } from "jsr:@std/path";
 import { getPonsHome } from "jsr:@pons/sdk@^0.2";
 import { ConfigManager } from "./config/manager.ts";
 import { createLogger } from "./logs/logger.ts";
@@ -17,12 +16,12 @@ function readVersion(): string {
   // module.json is stamped with the version by the CLI after JSR download
   const manifestPath = join(baseDir, "module.json");
   try {
-    const manifest = JSON.parse(readFileSync(manifestPath, "utf-8"));
+    const manifest = JSON.parse(Deno.readTextFileSync(manifestPath));
     if (manifest.version) return manifest.version;
   } catch { /* fall through */ }
   // Fallback: deno.json (available in local dev, stripped by JSR)
   try {
-    const pkg = JSON.parse(readFileSync(join(baseDir, "deno.json"), "utf-8"));
+    const pkg = JSON.parse(Deno.readTextFileSync(join(baseDir, "deno.json")));
     return pkg.version || "0.0.0";
   } catch {
     return "0.0.0";
@@ -128,15 +127,15 @@ export default class Kernel {
   async start(): Promise<this> {
     this.lifecycle.spawnAll(this.modules);
 
-    process.once("SIGINT", () => {
+    Deno.addSignalListener("SIGINT", () => {
       this.shutdown().catch(console.error);
     });
-    process.once("SIGTERM", () => {
+    Deno.addSignalListener("SIGTERM", () => {
       this.shutdown().catch(console.error);
     });
 
     // Config hot-reload: CLI sends SIGUSR1 after writing config
-    process.on("SIGUSR1", () => {
+    Deno.addSignalListener("SIGUSR1", () => {
       this.logger.info("Received SIGUSR1 — reloading config");
       try {
         const oldConfig = structuredClone(this.configManager.getAll());
@@ -194,7 +193,7 @@ export default class Kernel {
     });
 
     // Permission hot-reload: CLI sends SIGUSR2 after revoking permissions
-    process.on("SIGUSR2", () => {
+    Deno.addSignalListener("SIGUSR2", () => {
       this.logger.info("Received SIGUSR2 — reloading permissions");
       try {
         this.permissionStore.reload();
@@ -217,8 +216,8 @@ export default class Kernel {
 
     // Write PID file for CLI process management
     const runtimeDir = join(getPonsHome(), ".runtime");
-    mkdirSync(runtimeDir, { recursive: true });
-    writeFileSync(join(runtimeDir, "kernel.pid"), String(process.pid), "utf-8");
+    Deno.mkdirSync(runtimeDir, { recursive: true });
+    Deno.writeTextFileSync(join(runtimeDir, "kernel.pid"), String(Deno.pid));
 
     return this;
   }
@@ -231,7 +230,7 @@ export default class Kernel {
 
     // Remove PID file
     try {
-      unlinkSync(join(getPonsHome(), ".runtime", "kernel.pid"));
+      Deno.removeSync(join(getPonsHome(), ".runtime", "kernel.pid"));
     } catch { /* may not exist */ }
 
     Deno.exit(0);

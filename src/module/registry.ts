@@ -3,14 +3,24 @@
  * and the service directory (which module provides which service).
  */
 
-import type { ChildProcess } from 'node:child_process';
 import type { ModuleManifest } from 'jsr:@pons/sdk@^0.2';
 
 export type ModuleStatus = 'starting' | 'ready' | 'restarting' | 'stopped' | 'crashed';
 
+/** Minimal interface shared by DenoChildProcessWrapper and any test doubles. */
+export interface ChildProcessLike {
+  readonly pid: number;
+  connected: boolean;
+  send(msg: unknown): void;
+  kill(signal?: string): void;
+  on(event: 'message', handler: (msg: unknown) => void): void;
+  on(event: 'exit', handler: (code: number | null, signal: string | null) => void): void;
+  once(event: 'exit', handler: (code: number | null, signal: string | null) => void): void;
+}
+
 export interface ModuleEntry {
   manifest: ModuleManifest;
-  process: ChildProcess | null;
+  process: ChildProcessLike | null;
   status: ModuleStatus;
   pid: number | undefined;
   restartCount: number;
@@ -37,7 +47,7 @@ export class ModuleRegistry {
     });
   }
 
-  setProcess(id: string, proc: ChildProcess): void {
+  setProcess(id: string, proc: ChildProcessLike): void {
     const entry = this.modules.get(id);
     if (!entry) return;
     entry.process = proc;

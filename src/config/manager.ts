@@ -3,10 +3,7 @@
  * validates config.yaml, provides CRUD, doctor diagnostics.
  */
 
-import { readFileSync, writeFileSync, existsSync } from "node:fs";
-import { join } from "node:path";
-import { realpathSync } from "node:fs";
-import { pathToFileURL } from "node:url";
+import { join, toFileUrl } from "jsr:@std/path";
 import { parse as parseYaml, stringify as stringifyYaml } from "npm:yaml@^2.7.1";
 import { z } from "npm:zod@^3.24";
 import type { ZodObject, ZodRawShape } from "npm:zod@^3.24";
@@ -71,16 +68,16 @@ export class ConfigManager {
 
       try {
         const schemaPath = join(moduleDir, manifest.configSchema);
-        if (!existsSync(schemaPath)) continue;
+        try { Deno.statSync(schemaPath); } catch { continue; }
 
-        const realPath = realpathSync(schemaPath);
-        const realModuleDir = realpathSync(moduleDir);
+        const realPath = Deno.realPathSync(schemaPath);
+        const realModuleDir = Deno.realPathSync(moduleDir);
         // Security: verify schema path is within the module directory (prevent path traversal)
         if (!realPath.startsWith(realModuleDir + '/')) {
           console.warn(`[config] Schema path escapes module directory for "${manifest.id}" — skipping`);
           continue;
         }
-        const mod = await import(pathToFileURL(realPath).href);
+        const mod = await import(toFileUrl(realPath).href);
         const definition: ConfigSchemaDefinition = mod.default;
 
         if (!definition?.schema) continue;
@@ -140,14 +137,14 @@ export class ConfigManager {
    * Load config.yaml, validate against AppConfig, fill defaults.
    */
   load(): KernelConfig {
-    if (!existsSync(this.configPath)) {
+    try { Deno.statSync(this.configPath); } catch {
       if (this.appSchema) {
         this.configData = this.appSchema.parse({}) as Record<string, unknown>;
       }
       return this.configData as KernelConfig;
     }
 
-    const raw = readFileSync(this.configPath, "utf-8");
+    const raw = Deno.readTextFileSync(this.configPath);
     const parsed: Record<string, unknown> = parseYaml(raw) || {};
 
     if (this.appSchema) {
@@ -172,7 +169,7 @@ export class ConfigManager {
    */
   save(): void {
     const yaml = stringifyYaml(this.configData, { lineWidth: 120 });
-    writeFileSync(this.configPath, yaml, "utf-8");
+    Deno.writeTextFileSync(this.configPath, yaml);
   }
 
   // ─── CRUD ──────────────────────────────────────────────────

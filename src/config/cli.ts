@@ -5,9 +5,7 @@
  * and discovering module schemas from the filesystem.
  */
 
-import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
-import { join, resolve } from "node:path";
-import { spawnSync } from "node:child_process";
+import { join, resolve } from "jsr:@std/path";
 import chalk from "npm:chalk@^5.6.2";
 import { getPonsHome } from "jsr:@pons/sdk@^0.2";
 import type { ModuleManifest } from "jsr:@pons/sdk@^0.2";
@@ -22,19 +20,19 @@ type Command = { command(name: string): any; description(desc: string): any; act
  */
 function discoverModules(home: string): Array<{ manifest: ModuleManifest; moduleDir: string }> {
   const modulesDir = resolve(home, "modules");
-  if (!existsSync(modulesDir)) return [];
+  try { Deno.statSync(modulesDir); } catch { return []; }
 
   const result: Array<{ manifest: ModuleManifest; moduleDir: string }> = [];
 
-  for (const entry of readdirSync(modulesDir)) {
-    const moduleDir = join(modulesDir, entry);
-    try { if (!statSync(moduleDir).isDirectory()) continue; } catch { continue; }
+  for (const entry of Deno.readDirSync(modulesDir)) {
+    const moduleDir = join(modulesDir, entry.name);
+    try { if (!Deno.statSync(moduleDir).isDirectory) continue; } catch { continue; }
 
     const manifestPath = join(moduleDir, "module.json");
-    if (!existsSync(manifestPath)) continue;
+    try { Deno.statSync(manifestPath); } catch { continue; }
 
     try {
-      const manifest: ModuleManifest = JSON.parse(readFileSync(manifestPath, "utf-8"));
+      const manifest: ModuleManifest = JSON.parse(Deno.readTextFileSync(manifestPath));
       if (manifest.id && manifest.name) {
         result.push({ manifest, moduleDir });
       }
@@ -59,15 +57,15 @@ async function createManager(): Promise<ConfigManager> {
 /**
  * Check if kernel is running and send config update signal.
  */
-function notifyKernel(changedKeys: string[]): void {
+function notifyKernel(_changedKeys: string[]): void {
   const home = getPonsHome();
   const pidPath = join(home, ".runtime", "kernel.pid");
-  if (!existsSync(pidPath)) return;
+  try { Deno.statSync(pidPath); } catch { return; }
 
   try {
-    const pid = parseInt(readFileSync(pidPath, "utf-8").trim(), 10);
+    const pid = parseInt(Deno.readTextFileSync(pidPath).trim(), 10);
     if (!Number.isNaN(pid)) {
-      process.kill(pid, "SIGUSR1");
+      Deno.kill(pid, "SIGUSR1");
     }
   } catch {
     // Kernel not running — ignore
@@ -118,7 +116,7 @@ export function initConfigCommands(program: Command): void {
       const value = manager.get(keyPath);
       if (value === undefined) {
         printError(`Key "${keyPath}" not found`);
-        process.exitCode = 1;
+        Deno.exitCode = 1;
       } else {
         console.log(formatValue(value));
       }
@@ -136,7 +134,7 @@ export function initConfigCommands(program: Command): void {
         notifyKernel([keyPath]);
       } else {
         printError(result.error!);
-        process.exitCode = 1;
+        Deno.exitCode = 1;
       }
     });
 
@@ -159,7 +157,7 @@ export function initConfigCommands(program: Command): void {
         const data = manager.getSection(opts.section);
         if (data === undefined) {
           printError(`Section "${opts.section}" not found`);
-          process.exitCode = 1;
+          Deno.exitCode = 1;
           return;
         }
         printHeader(`Config: ${opts.section}`);
@@ -223,9 +221,9 @@ export function initConfigCommands(program: Command): void {
     .action(async () => {
       const home = getPonsHome();
       const configPath = join(home, "config.yaml");
-      const editor = process.env["EDITOR"] || process.env["VISUAL"] || "vi";
+      const editor = Deno.env.get("EDITOR") || Deno.env.get("VISUAL") || "vi";
 
-      spawnSync(editor, [configPath], { stdio: "inherit" });
+      new Deno.Command(editor, { args: [configPath], stdin: "inherit", stdout: "inherit", stderr: "inherit" }).outputSync();
 
       // Re-validate after edit
       const manager = await createManager();
@@ -261,7 +259,7 @@ export function initConfigCommands(program: Command): void {
 
       if (!keyPath) {
         printError("Specify a key path or use --all");
-        process.exitCode = 1;
+        Deno.exitCode = 1;
         return;
       }
 
@@ -271,7 +269,7 @@ export function initConfigCommands(program: Command): void {
         notifyKernel([keyPath]);
       } else {
         printError(result.error!);
-        process.exitCode = 1;
+        Deno.exitCode = 1;
       }
     });
 
