@@ -28,7 +28,7 @@ export class ModuleLoader {
 
   discover(): DiscoveredModule[] {
     try { Deno.statSync(this.modulesDir); } catch {
-      this.logger.warn({ modulesDir: this.modulesDir }, 'No modules directory found — nothing to discover');
+      this.logger.debug({ modulesDir: this.modulesDir }, 'No modules directory found — nothing to discover');
       return [];
     }
 
