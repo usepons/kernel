@@ -74,6 +74,12 @@ export class ConfigManager {
         if (!existsSync(schemaPath)) continue;
 
         const realPath = realpathSync(schemaPath);
+        const realModuleDir = realpathSync(moduleDir);
+        // Security: verify schema path is within the module directory (prevent path traversal)
+        if (!realPath.startsWith(realModuleDir + '/')) {
+          console.warn(`[config] Schema path escapes module directory for "${manifest.id}" — skipping`);
+          continue;
+        }
         const mod = await import(pathToFileURL(realPath).href);
         const definition: ConfigSchemaDefinition = mod.default;
 

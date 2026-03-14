@@ -20,6 +20,9 @@ import { writeModuleLog, writeModuleLogGroup } from './logs/logger.ts';
 import type { MessageBus } from './messaging/bus.ts';
 import { ModuleRegistry } from './module/registry.ts';
 import type { KernelMessage, ModuleMessage, ModuleManifest } from 'jsr:@pons/sdk@^0.2';
+import type { SecurityEnforcer } from './security/enforcer.ts';
+import { translateToDenoFlags } from './security/permissions.ts';
+import type { ModulePermissions, PermissionStore } from './security/permissions.ts';
 
 
 const VALID_MODULE_TYPES = new Set([
@@ -81,6 +84,8 @@ export class LifecycleManager {
     private readonly bus: MessageBus,
     private readonly initPayload: { config: unknown; workspacePath: string; projectRoot: string },
     private readonly onModuleCall: (moduleId: string, method: string, params: unknown) => Promise<unknown>,
+    private readonly enforcer?: SecurityEnforcer,
+    private readonly permissionStore?: PermissionStore,
   ) {
     this.denoConfigPath = this.findDenoConfig();
   }
@@ -99,6 +104,12 @@ export class LifecycleManager {
   }
 
   async spawn(runnerPath: string, manifest: ModuleManifest, env?: Record<string, string>): Promise<void> {
+    // Security: verify module permissions are approved before spawning
+    if (this.permissionStore && !this.permissionStore.isApproved(manifest.id)) {
+      this.logger.warn({ module: manifest.id }, 'Module not approved — refusing to spawn (run `pons modules install` to approve permissions)');
+      return;
+    }
+
     // Only register fresh if not already in the registry (avoids resetting restartCount on respawn)
     if (!this.registry.get(manifest.id)) {
       this.registry.register(manifest);
@@ -134,7 +145,17 @@ export class LifecycleManager {
     this.registry.setProcess(manifest.id, proc);
     this.logger.debug({ module: manifest.id, pid: proc.pid }, 'Module process spawned');
 
-    this.send(manifest.id, { type: 'init', ...this.initPayload });
+    // Security: scope config to module's own section only (never send full config)
+    const moduleConfigKey = manifest.configKey;
+    const scopedConfig = moduleConfigKey && typeof this.initPayload.config === 'object' && this.initPayload.config !== null
+      ? { [moduleConfigKey]: (this.initPayload.config as Record<string, unknown>)[moduleConfigKey] }
+      : {};
+    this.send(manifest.id, {
+      type: 'init',
+      config: scopedConfig,
+      workspacePath: this.initPayload.workspacePath,
+      projectRoot: this.initPayload.projectRoot,
+    });
   }
 
   // ─── Kill / Hot-swap ──────────────────────────────────────────
@@ -165,6 +186,26 @@ export class LifecycleManager {
   }
 
   async hotSwap(moduleId: string, newRunnerPath: string, newManifest: ModuleManifest, env?: Record<string, string>): Promise<void> {
+    // Security: validate new manifest permissions against existing approval before swapping
+    if (this.permissionStore && newManifest.permissions) {
+      const approved = this.permissionStore.getApproved(newManifest.id);
+      if (!approved) {
+        this.logger.error({ module: newManifest.id }, 'Hot-swap blocked — new manifest has no approved permissions');
+        return;
+      }
+      // Check if new manifest requests permissions not in the approved set
+      const newPerms = newManifest.permissions as unknown as Record<string, string[]>;
+      const approvedPerms = approved.permissions as unknown as Record<string, string[]>;
+      for (const [key, values] of Object.entries(newPerms)) {
+        const approvedValues = approvedPerms[key] ?? [];
+        const unapproved = (values ?? []).filter((v: string) => !approvedValues.includes(v));
+        if (unapproved.length > 0) {
+          this.logger.error({ module: newManifest.id, permission: key, unapproved }, 'Hot-swap blocked — new manifest requests unapproved permissions');
+          return;
+        }
+      }
+    }
+
     this.logger.info({ module: moduleId }, 'Hot-swap: draining old process');
     await this.kill(moduleId, 'hot-swap');
     this.registry.remove(moduleId);
@@ -203,8 +244,24 @@ export class LifecycleManager {
       return;
     }
 
-    // Subscribe to bus topics
+    // Security: validate topic subscriptions before registering (fail-closed)
     const topics = manifest.subscribes ?? [];
+    if (this.enforcer && topics.length > 0) {
+      const permissions = this.enforcer.getModulePermissions(moduleId);
+      if (!permissions) {
+        this.enforcer.logViolation({ timestamp: new Date().toISOString(), moduleId, type: 'topic', resource: `subscribe:${topics[0]}`, action: 'deny' });
+        this.kill(moduleId, 'security-violation');
+        return;
+      }
+      for (const topic of topics) {
+        const violation = this.enforcer.checkTopic(moduleId, topic, 'subscribe', permissions);
+        if (violation) {
+          this.enforcer.logViolation(violation);
+          this.kill(moduleId, 'security-violation');
+          return;
+        }
+      }
+    }
     this.bus.subscribe(moduleId, topics);
 
     // Register provided services
@@ -251,6 +308,22 @@ export class LifecycleManager {
   }
 
   private onPublish(fromModuleId: string, topic: string, payload: unknown): void {
+    // Security: check publish permission (fail-closed: deny if permissions not found)
+    if (this.enforcer) {
+      const permissions = this.enforcer.getModulePermissions(fromModuleId);
+      if (!permissions) {
+        this.enforcer.logViolation({ timestamp: new Date().toISOString(), moduleId: fromModuleId, type: 'topic', resource: `publish:${topic}`, action: 'deny' });
+        this.kill(fromModuleId, 'security-violation');
+        return;
+      }
+      const violation = this.enforcer.checkTopic(fromModuleId, topic, 'publish', permissions);
+      if (violation) {
+        this.enforcer.logViolation(violation);
+        this.kill(fromModuleId, 'security-violation');
+        return;
+      }
+    }
+
     const subscribers = this.bus.getSubscribers(topic, fromModuleId);
     for (const subscriberId of subscribers) {
       const entry = this.registry.get(subscriberId);
@@ -298,6 +371,24 @@ export class LifecycleManager {
   }
 
   private onRpcRequest(callerModuleId: string, rpcId: string, service: string, method: string, params?: unknown): void {
+    // Security: check RPC permission (fail-closed: deny if permissions not found)
+    if (this.enforcer) {
+      const permissions = this.enforcer.getModulePermissions(callerModuleId);
+      if (!permissions) {
+        this.enforcer.logViolation({ timestamp: new Date().toISOString(), moduleId: callerModuleId, type: 'rpc', resource: service, action: 'deny' });
+        this.send(callerModuleId, { type: 'rpc_response', id: rpcId, error: `Security violation: no approved permissions` });
+        this.kill(callerModuleId, 'security-violation');
+        return;
+      }
+      const violation = this.enforcer.checkRpc(callerModuleId, service, permissions);
+      if (violation) {
+        this.enforcer.logViolation(violation);
+        this.send(callerModuleId, { type: 'rpc_response', id: rpcId, error: `Security violation: not permitted to call service "${service}"` });
+        this.kill(callerModuleId, 'security-violation');
+        return;
+      }
+    }
+
     const targetModuleId = this.registry.resolveService(service);
     if (!targetModuleId) {
       this.send(callerModuleId, { type: 'rpc_response', id: rpcId, error: `Service not found: ${service}` });
@@ -527,7 +618,10 @@ export class LifecycleManager {
     const stdio: ['pipe', 'pipe', 'pipe', 'ipc'] = ['pipe', 'pipe', 'pipe', 'ipc'];
 
     if (isDeno) {
-      const denoPerms = manifest.runtimePermissions ?? ['--allow-all'];
+      // Security: translate manifest permissions to Deno flags (never --allow-all)
+      const denoPerms = manifest.permissions
+        ? translateToDenoFlags(manifest.permissions as ModulePermissions)
+        : ['--deny-all'];
       // Prefer the module's own deno.json (needed for nodeModulesDir, import maps, etc.)
       const moduleDenoConfig = join(dirname(runnerPath), 'deno.json');
       const configPath = existsSync(moduleDenoConfig) ? moduleDenoConfig : this.denoConfigPath;

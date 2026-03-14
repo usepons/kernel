@@ -9,6 +9,8 @@ import { LifecycleManager } from "./lifecycle.ts";
 import { ModuleLoader } from "./module/loader.ts";
 import type { DiscoveredModule } from "./module/loader.ts";
 import type { KernelConfig, LogLevel } from "./config/types.ts";
+import { PermissionStore } from "./security/permissions.ts";
+import { SecurityEnforcer } from "./security/enforcer.ts";
 
 function readVersion(): string {
   const baseDir = join(dirname(new URL(import.meta.url).pathname), "..");
@@ -37,6 +39,8 @@ export default class Kernel {
   private moduleLoader: ModuleLoader;
   private bus: MessageBus;
   private lifecycle: LifecycleManager;
+  private permissionStore: PermissionStore;
+  private enforcer: SecurityEnforcer;
 
   private modules: DiscoveredModule[] = [];
 
@@ -56,13 +60,17 @@ export default class Kernel {
 
     this.configManager = new ConfigManager(configPath);
     this.bus = new MessageBus();
-    this.moduleLoader = new ModuleLoader(this.modulesDir);
+    this.permissionStore = new PermissionStore();
+    this.enforcer = new SecurityEnforcer(this.permissionStore, this.logger);
+    this.moduleLoader = new ModuleLoader(this.modulesDir, this.permissionStore);
     this.lifecycle = new LifecycleManager(
       this.logger,
       this.bus,
       { config: this.configManager.getAll(), workspacePath: getPonsHome(), projectRoot: getPonsHome() },
       (moduleId, method, params) =>
         this.handleModuleCall(moduleId, method, params),
+      this.enforcer,
+      this.permissionStore,
     );
   }
 
@@ -107,6 +115,8 @@ export default class Kernel {
       { config, workspacePath: getPonsHome(), projectRoot: getPonsHome() },
       (moduleId, method, params) =>
         this.handleModuleCall(moduleId, method, params),
+      this.enforcer,
+      this.permissionStore,
     );
 
     return this;
@@ -166,10 +176,11 @@ export default class Kernel {
           const manifest = entry.manifest;
           const moduleConfigKey = manifest.configKey;
           if (moduleConfigKey && changedSections.includes(moduleConfigKey)) {
+            // Security: send only the module's own config section and relevant changed sections
             this.lifecycle["send"](moduleId, {
               type: "config:update" as const,
-              config: this._config,
-              changedSections,
+              config: { [moduleConfigKey]: this.configManager.getSection(moduleConfigKey) },
+              changedSections: changedSections.filter((s: string) => s === moduleConfigKey),
             });
             this.logger.debug(
               { module: moduleId, changedSections },
@@ -179,6 +190,26 @@ export default class Kernel {
         }
       } catch (err) {
         this.logger.error({ error: String(err) }, "Failed to reload config");
+      }
+    });
+
+    // Permission hot-reload: CLI sends SIGUSR2 after revoking permissions
+    process.on("SIGUSR2", () => {
+      this.logger.info("Received SIGUSR2 — reloading permissions");
+      try {
+        this.permissionStore.reload();
+        // Kill modules whose permissions were reduced or revoked
+        for (const moduleId of this.lifecycle.getRegistry().ids()) {
+          const entry = this.lifecycle.getRegistry().get(moduleId);
+          if (!entry || entry.status === "stopped" || entry.status === "crashed") continue;
+
+          if (!this.permissionStore.isApproved(moduleId)) {
+            this.logger.warn({ module: moduleId }, "Permissions revoked — killing module");
+            this.lifecycle.kill(moduleId, "permissions-revoked");
+          }
+        }
+      } catch (err) {
+        this.logger.error({ error: String(err) }, "Failed to reload permissions");
       }
     });
 
@@ -207,17 +238,35 @@ export default class Kernel {
   }
 
   private async handleModuleCall(
-    _moduleId: string,
+    moduleId: string,
     method: string,
     params: unknown,
   ): Promise<unknown> {
+    // Security: get the calling module's manifest for config scoping
+    const callerEntry = this.lifecycle.getRegistry().get(moduleId);
+    const callerConfigKey = callerEntry?.manifest?.configKey;
+
     switch (method) {
       case "config.get": {
         const key = (params as { key: string }).key;
+        // Security: enforce config scope — module can only read its own section
+        const violation = this.enforcer.checkConfig(moduleId, key, callerConfigKey);
+        if (violation) {
+          this.enforcer.logViolation(violation);
+          this.lifecycle.kill(moduleId, "security-violation");
+          throw new Error(`Security violation: not permitted to read config key "${key}"`);
+        }
         return this.configManager.get(key);
       }
       case "config.set": {
         const { key, value } = params as { key: string; value: unknown };
+        // Security: enforce config scope — module can only write its own section
+        const violation = this.enforcer.checkConfig(moduleId, key, callerConfigKey);
+        if (violation) {
+          this.enforcer.logViolation(violation);
+          this.lifecycle.kill(moduleId, "security-violation");
+          throw new Error(`Security violation: not permitted to write config key "${key}"`);
+        }
         const result = this.configManager.set(key, value);
         if (result.success) {
           const affected = this.configManager.getAffectedModules([key]);
@@ -226,9 +275,11 @@ export default class Kernel {
             if (modId === "__kernel__") continue;
             const entry = this.lifecycle.getRegistry().get(modId);
             if (entry?.process?.connected) {
+              // Security: send only the affected module's own config section
+              const modConfigKey = entry.manifest?.configKey;
               this.lifecycle["send"](modId, {
                 type: "config:update" as const,
-                config: this.configManager.getAll(),
+                config: modConfigKey ? { [modConfigKey]: this.configManager.getSection(modConfigKey) } : {},
                 changedSections: [section],
               });
             }
@@ -237,7 +288,11 @@ export default class Kernel {
         return result;
       }
       case "config.sections":
-        return this.configManager.listSections();
+        // Security: filter to return only the calling module's own section metadata
+        return this.configManager.listSections().filter(
+          (s: { key: string }) => s.key === callerConfigKey,
+        );
+      // Intentionally ungated: topology knowledge ≠ data access (RPC enforcement prevents unauthorized calls)
       case "module.list":
         return this.lifecycle.getRegistry().allPublic();
       case "module.commands":
@@ -246,9 +301,9 @@ export default class Kernel {
         return this.lifecycle.getRegistry().listServices();
       case "service.resolve": {
         const service = (params as { service: string }).service;
-        const moduleId = this.lifecycle.getRegistry().resolveService(service);
-        if (!moduleId) throw new Error(`Service not found: ${service}`);
-        return moduleId;
+        const resolved = this.lifecycle.getRegistry().resolveService(service);
+        if (!resolved) throw new Error(`Service not found: ${service}`);
+        return resolved;
       }
       default:
         throw new Error(`Unknown kernel method: ${method}`);

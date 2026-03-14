@@ -40,6 +40,7 @@ import {
   updateModuleFromJsr,
 } from "./modules/installer.ts";
 import { initConfigCommands } from "./config/cli.ts";
+import { PermissionStore } from './security/permissions.ts';
 
 // deno-lint-ignore no-explicit-any
 type Command = { command(name: string): any; description(desc: string): any; action(fn: any): any; option(flags: string, desc: string): any };
@@ -213,6 +214,8 @@ async function stopKernel(home: string): Promise<boolean> {
 function spawnDetached(home: string, logLevel?: string): void {
   const entryPath = new URL("./index.ts", import.meta.url).pathname;
 
+  // Security: kernel is the Trusted Computing Base — it requires --allow-all to manage
+  // child processes, config, and signals. Module subprocesses are sandboxed with scoped Deno flags.
   const args = ["run", "--allow-all", "--unstable-sloppy-imports", entryPath];
   if (logLevel) {
     args.push("--log-level", logLevel);
@@ -555,10 +558,11 @@ export function init(program: Command): void {
     .description("Install a module from npm, git URL, or local path")
     .option("--home <path>", "Override PONS_HOME directory")
     .option("--json", "Output as JSON")
-    .action(async (moduleName: string, opts: { home?: string; json?: boolean }) => {
+    .option("-y, --yes", "Auto-approve permissions")
+    .action(async (moduleName: string, opts: { home?: string; json?: boolean; yes?: boolean }) => {
       const json = opts.json ?? false;
 
-      const success = await installModule(moduleName, opts.home);
+      const success = await installModule(moduleName, opts.home, opts.yes);
 
       if (json) {
         outputJson({ module: moduleName, installed: success });
@@ -629,6 +633,18 @@ export function init(program: Command): void {
 
       try {
         rmSync(moduleDir, { recursive: true, force: true });
+
+        // Security: revoke permissions on uninstall
+        const store = new PermissionStore(home);
+        const moduleId = manifest?.id ?? moduleName;
+        store.revoke(moduleId);
+
+        // Signal kernel to reload permissions if running
+        const pid = readPid(home);
+        if (pid !== null && isProcessRunning(pid)) {
+          try { process.kill(pid, "SIGUSR2"); } catch { /* kernel may be gone */ }
+        }
+
         spinner.succeed(`Uninstalled ${chalk.green(moduleName)}`);
 
         if (json) {
@@ -773,6 +789,131 @@ export function init(program: Command): void {
           );
           console.log(chalk.dim("    pons gateway restart"));
           console.log();
+        }
+      }
+    });
+
+  /* ================================================================ */
+  /*  Permission management commands                                   */
+  /* ================================================================ */
+
+  const permissions = program
+    .command("permissions")
+    .description("Manage module permissions");
+
+  /* ---- permissions list ---- */
+  permissions
+    .command("list [module]")
+    .description("List approved permissions for a module or all modules")
+    .option("--home <path>", "Override PONS_HOME directory")
+    .option("--json", "Output as JSON")
+    .action(async (moduleName: string | undefined, opts: { home?: string; json?: boolean }) => {
+      const json = opts.json ?? false;
+      const home = opts.home || getPonsHome();
+      const store = new PermissionStore(home);
+      const allPerms = store.listAll();
+
+      if (moduleName) {
+        const granted = store.getApproved(moduleName);
+        if (!granted) {
+          if (json) {
+            outputJson({ module: moduleName, permissions: null, error: "not found" });
+          } else {
+            printError(`No permissions found for module "${moduleName}".`);
+          }
+          process.exitCode = 1;
+          return;
+        }
+
+        if (json) {
+          outputJson({ module: moduleName, ...granted });
+          return;
+        }
+
+        printHeader(`Permissions: ${moduleName}`);
+        const table = createTable(["Type", "Values", "Granted"]);
+        const perms = granted.permissions;
+        for (const [key, values] of Object.entries(perms)) {
+          if (Array.isArray(values) && values.length > 0) {
+            table.push([key, values.join(", "), granted.grantedAt.split("T")[0]]);
+          }
+        }
+        console.log(table.toString());
+        console.log();
+      } else {
+        // List all modules
+        const moduleIds = Object.keys(allPerms);
+        if (moduleIds.length === 0) {
+          if (json) {
+            outputJson({ modules: [] });
+          } else {
+            console.log(chalk.dim("  No module permissions configured."));
+            console.log();
+          }
+          return;
+        }
+
+        if (json) {
+          outputJson({ modules: allPerms });
+          return;
+        }
+
+        printHeader(`Module Permissions (${moduleIds.length})`);
+        const table = createTable(["Module", "Net", "Read", "Write", "Services", "Topics"]);
+        for (const [id, granted] of Object.entries(allPerms)) {
+          const p = granted.permissions;
+          table.push([
+            id,
+            (p.net ?? []).join(", ") || chalk.dim("\u2014"),
+            (p.read ?? []).join(", ") || chalk.dim("\u2014"),
+            (p.write ?? []).join(", ") || chalk.dim("\u2014"),
+            (p.services ?? []).join(", ") || chalk.dim("\u2014"),
+            (p.topics ?? []).join(", ") || chalk.dim("\u2014"),
+          ]);
+        }
+        console.log(table.toString());
+        console.log();
+      }
+    });
+
+  /* ---- permissions revoke ---- */
+  permissions
+    .command("revoke <module> [type] [value]")
+    .description("Revoke permissions for a module")
+    .option("--home <path>", "Override PONS_HOME directory")
+    .option("--json", "Output as JSON")
+    .action(async (moduleName: string, type: string | undefined, value: string | undefined, opts: { home?: string; json?: boolean }) => {
+      const json = opts.json ?? false;
+      const home = opts.home || getPonsHome();
+      const store = new PermissionStore(home);
+
+      const success = store.revoke(moduleName, type, value);
+
+      if (!success) {
+        if (json) {
+          outputJson({ module: moduleName, revoked: false, error: "not found or invalid type" });
+        } else {
+          printError(`Failed to revoke permissions for "${moduleName}". Module may not have approved permissions.`);
+        }
+        process.exitCode = 1;
+        return;
+      }
+
+      if (json) {
+        outputJson({ module: moduleName, revoked: true, type: type ?? "all", value: value ?? "all" });
+      } else {
+        const desc = type ? (value ? `${type}:${value}` : type) : "all permissions";
+        console.log(`Revoked ${chalk.yellow(desc)} for ${chalk.green(moduleName)}.`);
+      }
+
+      // Signal kernel to reload permissions if running
+      const pid = readPid(home);
+      if (pid !== null && isProcessRunning(pid)) {
+        try {
+          process.kill(pid, "SIGUSR2");
+          console.log(chalk.dim("  Kernel notified — affected module will be restarted."));
+        } catch {
+          console.log(chalk.dim("  Could not signal kernel — restart manually for changes to take effect."));
         }
       }
     });

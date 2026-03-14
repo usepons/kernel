@@ -10,6 +10,8 @@ import { join } from 'node:path';
 import { existsSync, readdirSync, statSync, readFileSync } from 'node:fs';
 import type { ModuleManifest } from 'jsr:@pons/sdk@^0.2';
 import { createLogger, type KernelLogger } from '../logs/logger.ts';
+import { modulePermissionsSchema, computeManifestHash } from '../security/permissions.ts';
+import type { PermissionStore } from '../security/permissions.ts';
 
 export interface DiscoveredModule {
   manifest: ModuleManifest;
@@ -21,7 +23,7 @@ export class ModuleLoader {
 
   logger: KernelLogger;
 
-  constructor(private readonly modulesDir: string) {
+  constructor(private readonly modulesDir: string, private readonly permissionStore?: PermissionStore) {
     this.logger = createLogger()
   }
 
@@ -59,6 +61,31 @@ export class ModuleLoader {
           !manifest.name || typeof manifest.name !== 'string') {
         this.logger.warn({ path: manifestPath }, 'Invalid manifest — missing id or name — skipping');
         continue;
+      }
+
+      // Security: validate permissions block
+      if (!manifest.permissions) {
+        this.logger.warn({ module: manifest.id, path: manifestPath }, 'Module missing permissions block — skipping (security policy: deny by default)');
+        continue;
+      }
+
+      try {
+        modulePermissionsSchema.parse(manifest.permissions);
+      } catch (err) {
+        this.logger.warn({ module: manifest.id, error: String(err) }, 'Module has invalid permissions block — skipping');
+        continue;
+      }
+
+      // Security: manifest tamper detection
+      if (this.permissionStore) {
+        const storedHash = this.permissionStore.getManifestHash(manifest.id);
+        if (storedHash) {
+          const currentHash = computeManifestHash(manifestPath);
+          if (currentHash !== storedHash) {
+            this.logger.error({ module: manifest.id }, 'Module manifest has been modified since install — refusing to load (manifest-tampered)');
+            continue;
+          }
+        }
       }
 
       // Resolve version from deno.json in the module directory

@@ -7,7 +7,7 @@
  * Also supports local paths and git URLs for development.
  */
 
-import { execSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import {
   existsSync,
   lstatSync,
@@ -24,6 +24,8 @@ import chalk from "npm:chalk@^5.6.2";
 import { getPonsHome } from "jsr:@pons/sdk@^0.2";
 import type { ModuleManifest } from "jsr:@pons/sdk@^0.2";
 import { printError, printWarning } from "../formatters.ts";
+import { validatePermissions, computeManifestHash, PermissionStore } from '../security/permissions.ts';
+import * as prompts from 'npm:@clack/prompts@^0.10.1';
 
 // --- JSR API Types ---
 
@@ -77,6 +79,82 @@ function extractModuleName(nameOrUrl: string): string {
   const last = segments[segments.length - 1];
   // Strip common prefixes like "module-"
   return last.replace(/^module-/, "");
+}
+
+/**
+ * Display module permissions and ask the user for approval.
+ * Returns true if approved, false if rejected.
+ */
+async function displayAndApprovePermissions(
+  manifest: ModuleManifest,
+  manifestPath: string,
+  permissionStore: PermissionStore,
+  autoApprove = false,
+): Promise<boolean> {
+  if (!manifest.permissions) {
+    printError(`Module "${manifest.id}" does not declare a permissions block. Cannot install.`);
+    return false;
+  }
+
+  let permissions;
+  try {
+    permissions = validatePermissions(manifest.permissions);
+  } catch {
+    printError(`Module "${manifest.id}" has an invalid permissions block.`);
+    return false;
+  }
+
+  // Display permissions summary
+  console.log();
+  console.log(chalk.bold(`  Permissions requested by ${chalk.cyan(manifest.id)}:`));
+  console.log();
+
+  const entries: [string, string[]][] = [
+    ['Network', permissions.net ?? []],
+    ['Read', permissions.read ?? []],
+    ['Write', permissions.write ?? []],
+    ['Env', permissions.env ?? []],
+    ['Run', permissions.run ?? []],
+    ['Services', permissions.services ?? []],
+    ['Topics', permissions.topics ?? []],
+  ];
+
+  for (const [label, values] of entries) {
+    if (values.length > 0) {
+      console.log(`  ${chalk.yellow(label)}: ${values.join(', ')}`);
+    }
+  }
+  console.log();
+
+  if (autoApprove) {
+    console.log(chalk.dim('  Auto-approved (--yes flag)'));
+    const hash = computeManifestHash(manifestPath);
+    permissionStore.approve(manifest.id, permissions, hash);
+
+    // Register service providers
+    for (const svc of manifest.provides ?? []) {
+      permissionStore.registerServiceProvider(svc, manifest.id);
+    }
+    return true;
+  }
+
+  const approved = await prompts.confirm({
+    message: 'Grant these permissions?',
+  });
+
+  if (prompts.isCancel(approved) || !approved) {
+    return false;
+  }
+
+  const hash = computeManifestHash(manifestPath);
+  permissionStore.approve(manifest.id, permissions, hash);
+
+  // Register service providers
+  for (const svc of manifest.provides ?? []) {
+    permissionStore.registerServiceProvider(svc, manifest.id);
+  }
+
+  return true;
 }
 
 // --- JSR Helpers ---
@@ -183,9 +261,11 @@ function stampModuleVersion(targetDir: string, version: string): void {
 export async function installModule(
   nameOrUrl: string,
   ponsHome?: string,
+  autoApprove = false,
 ): Promise<boolean> {
   const home = ponsHome || getPonsHome();
   const modulesDir = join(home, "modules");
+  const permStore = new PermissionStore(home);
 
   // Ensure modules directory exists
   if (!existsSync(modulesDir)) {
@@ -229,6 +309,17 @@ export async function installModule(
       spinner.succeed(
         `Linked ${chalk.green(manifest.id)} from ${chalk.dim(localPath)}`,
       );
+
+      // Security: approve permissions
+      const store = permStore;
+      const approved = await displayAndApprovePermissions(manifest, manifestPath, store, autoApprove);
+      if (!approved) {
+        // Clean up the symlink
+        rmSync(targetDir, { force: true });
+        console.log(chalk.yellow('  Installation cancelled — permissions rejected.'));
+        return false;
+      }
+
       return true;
     } catch (error) {
       spinner.fail(`Failed to create symlink for "${manifest.id}"`);
@@ -250,7 +341,7 @@ export async function installModule(
     const spinner = ora(`Cloning ${chalk.cyan(nameOrUrl)}...`).start();
 
     try {
-      execSync(`git clone --depth 1 ${nameOrUrl} ${targetDir}`, {
+      execFileSync('git', ['clone', '--depth', '1', '--', nameOrUrl, targetDir], {
         stdio: "pipe",
       });
 
@@ -263,6 +354,17 @@ export async function installModule(
       }
 
       spinner.succeed(`Installed ${chalk.green(moduleName)} from git`);
+
+      // Security: approve permissions
+      const manifest = JSON.parse(readFileSync(manifestPath, "utf-8")) as ModuleManifest;
+      const store = permStore;
+      const approved = await displayAndApprovePermissions(manifest, manifestPath, store, autoApprove);
+      if (!approved) {
+        rmSync(targetDir, { recursive: true, force: true });
+        console.log(chalk.yellow('  Installation cancelled — permissions rejected.'));
+        return false;
+      }
+
       return true;
     } catch (error) {
       spinner.fail(`Failed to install "${moduleName}" from git`);
@@ -346,6 +448,16 @@ export async function installModule(
     spinner.succeed(
       `Installed ${chalk.green(moduleName)} ${chalk.dim(`v${version}`)} from JSR`,
     );
+
+    // Security: approve permissions
+    const store = permStore;
+    const approved = await displayAndApprovePermissions(manifest, manifestPath, store, autoApprove);
+    if (!approved) {
+      rmSync(targetDir, { recursive: true, force: true });
+      console.log(chalk.yellow('  Installation cancelled — permissions rejected.'));
+      return false;
+    }
+
     return true;
   } catch (error) {
     spinner.fail(`Failed to install "${moduleName}" from JSR`);
