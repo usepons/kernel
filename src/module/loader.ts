@@ -6,7 +6,7 @@
  * ready to be spawned by the LifecycleManager.
  */
 
-import { join } from 'jsr:@std/path';
+import { join } from 'jsr:@std/path@^1';
 import type { ModuleManifest } from 'jsr:@pons/sdk@^0.2';
 import { createLogger, type KernelLogger } from '../logs/logger.ts';
 import { modulePermissionsSchema, computeManifestHash } from '../security/permissions.ts';

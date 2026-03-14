@@ -1,4 +1,4 @@
-import { dirname, join, resolve } from "jsr:@std/path";
+import { dirname, join, resolve } from "jsr:@std/path@^1";
 import { getPonsHome } from "jsr:@pons/sdk@^0.2";
 import { ConfigManager } from "./config/manager.ts";
 import { createLogger } from "./logs/logger.ts";

@@ -6,7 +6,7 @@
  */
 
 import pino from 'npm:pino@^10.3.1';
-import { join } from 'jsr:@std/path';
+import { join } from 'jsr:@std/path@^1';
 import type { LoggingConfig } from '../config/types.ts';
 import { createLogStream } from './stream.ts';
 import { formatInline } from './utils.ts';

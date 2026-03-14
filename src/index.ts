@@ -11,7 +11,7 @@
  * Everything else lives in modules.
  */
 
-import { join } from "jsr:@std/path";
+import { join } from "jsr:@std/path@^1";
 import type { LogLevel } from "./config/types.ts";
 import Kernel from './kernel.ts';
 import { getPonsHome } from "jsr:@pons/sdk@0.2";

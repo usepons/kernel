@@ -6,7 +6,7 @@
  * communicates with the running gateway via its HTTP API.
  */
 
-import { join } from "jsr:@std/path";
+import { join } from "jsr:@std/path@^1";
 import chalk from "npm:chalk@^5.6.2";
 import ora from "npm:ora@^8.2.0";
 import { getPonsHome } from "jsr:@pons/sdk@^0.2";

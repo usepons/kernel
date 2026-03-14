@@ -5,7 +5,7 @@
  * and discovering module schemas from the filesystem.
  */
 
-import { join, resolve } from "jsr:@std/path";
+import { join, resolve } from "jsr:@std/path@^1";
 import chalk from "npm:chalk@^5.6.2";
 import { getPonsHome } from "jsr:@pons/sdk@^0.2";
 import type { ModuleManifest } from "jsr:@pons/sdk@^0.2";

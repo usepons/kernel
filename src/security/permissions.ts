@@ -6,9 +6,9 @@
  * permissions in ~/.pons/permissions.yaml.
  */
 
-import { dirname, join } from 'jsr:@std/path';
-import { encodeHex } from 'jsr:@std/encoding/hex';
-import { crypto as stdCrypto } from 'jsr:@std/crypto';
+import { dirname, join } from 'jsr:@std/path@^1';
+import { encodeHex } from 'jsr:@std/encoding@^1/hex';
+import { crypto as stdCrypto } from 'jsr:@std/crypto@^1';
 import { z } from 'npm:zod@^3.24';
 import { parse as parseYaml, stringify as stringifyYaml } from 'npm:yaml@^2.7.1';
 import { getPonsHome } from 'jsr:@pons/sdk@^0.2';

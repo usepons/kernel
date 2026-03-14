@@ -3,7 +3,7 @@
  * validates config.yaml, provides CRUD, doctor diagnostics.
  */
 
-import { join, toFileUrl } from "jsr:@std/path";
+import { join, toFileUrl } from "jsr:@std/path@^1";
 import { parse as parseYaml, stringify as stringifyYaml } from "npm:yaml@^2.7.1";
 import { z } from "npm:zod@^3.24";
 import type { ZodObject, ZodRawShape } from "npm:zod@^3.24";

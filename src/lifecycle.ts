@@ -9,7 +9,7 @@
  *   2. RPC — direct IPC routing (non-persistent, exactly-once, timeout on failure)
  */
 
-import { dirname, join } from 'jsr:@std/path';
+import { dirname, join } from 'jsr:@std/path@^1';
 import type { DiscoveredModule } from './module/loader.ts';
 import type { KernelLogger } from './logs/logger.ts';
 import { writeModuleLog, writeModuleLogGroup } from './logs/logger.ts';
