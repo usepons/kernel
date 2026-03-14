@@ -63,11 +63,35 @@ export function validatePermissions(raw: unknown): ModulePermissions {
   return modulePermissionsSchema.parse(raw);
 }
 
+// ─── Binary Resolution ──────────────────────────────────────────
+
+/**
+ * Check whether a binary exists on the host by attempting to resolve it.
+ * Returns true if the binary is found in PATH, false otherwise.
+ */
+function binaryExists(name: string): boolean {
+  try {
+    const cmd = Deno.build.os === 'windows' ? 'where' : 'which';
+    const result = new Deno.Command(cmd, {
+      args: [name],
+      stdout: 'null',
+      stderr: 'null',
+    }).outputSync();
+    return result.success;
+  } catch {
+    return false;
+  }
+}
+
 // ─── Deno Flag Translation ──────────────────────────────────────
 
 /**
  * Convert declared permissions into Deno CLI permission flags.
  * Never produces --allow-all.
+ *
+ * Run permissions are resolved lazily: binaries not found on the host
+ * are silently omitted from --allow-run. This lets modules declare all
+ * binaries they *may* call without requiring every one to be installed.
  */
 export function translateToDenoFlags(permissions: ModulePermissions): string[] {
   const flags: string[] = [];
@@ -97,7 +121,12 @@ export function translateToDenoFlags(permissions: ModulePermissions): string[] {
   }
 
   if (permissions.run && permissions.run.length > 0) {
-    flags.push(`--allow-run=${permissions.run.join(',')}`);
+    const available = permissions.run.filter(binaryExists);
+    if (available.length > 0) {
+      flags.push(`--allow-run=${available.join(',')}`);
+    } else {
+      flags.push('--deny-run');
+    }
   } else {
     flags.push('--deny-run');
   }
