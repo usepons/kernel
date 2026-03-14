@@ -77,6 +77,30 @@ export class ConfigManager {
           console.warn(`[config] Schema path escapes module directory for "${manifest.id}" — skipping`);
           continue;
         }
+        // Security: validate schema file extension — only allow .ts/.js schema files
+        if (!realPath.endsWith('.ts') && !realPath.endsWith('.js')) {
+          console.warn(`[config] Schema file must be .ts or .js for "${manifest.id}" — skipping`);
+          continue;
+        }
+        // Security: static analysis — reject schema files containing dangerous APIs
+        const schemaSource = Deno.readTextFileSync(realPath);
+        const FORBIDDEN_PATTERNS = [
+          /\bDeno\s*\.\s*(run|Command|exec|remove|writeFile|writeTextFile|mkdir|rename|chmod|chown|kill|exit)\b/,
+          /\bDeno\s*\.\s*(listen|connect|listenTls|connectTls|serve)\b/,
+          /\bchild_process\b/,
+          /\bimport\s*\(/,       // dynamic imports
+          /\brequire\s*\(/,
+          /\beval\s*\(/,
+          /\bnew\s+Function\s*\(/,
+          /\bfetch\s*\(/,
+          /\bWebSocket\b/,
+        ];
+        const hasForbidden = FORBIDDEN_PATTERNS.find(p => p.test(schemaSource));
+        if (hasForbidden) {
+          console.warn(`[config] Schema file for "${manifest.id}" contains forbidden API pattern — skipping (matched: ${hasForbidden})`);
+          continue;
+        }
+
         const mod = await import(toFileUrl(realPath).href);
         const definition: ConfigSchemaDefinition = mod.default;
 
@@ -169,7 +193,7 @@ export class ConfigManager {
    */
   save(): void {
     const yaml = stringifyYaml(this.configData, { lineWidth: 120 });
-    Deno.writeTextFileSync(this.configPath, yaml);
+    Deno.writeTextFileSync(this.configPath, yaml, { mode: 0o600 });
   }
 
   // ─── CRUD ──────────────────────────────────────────────────

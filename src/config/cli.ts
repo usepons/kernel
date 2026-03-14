@@ -221,9 +221,16 @@ export function initConfigCommands(program: Command): void {
     .action(async () => {
       const home = getPonsHome();
       const configPath = join(home, "config.yaml");
-      const editor = Deno.env.get("EDITOR") || Deno.env.get("VISUAL") || "vi";
+      const rawEditor = Deno.env.get("EDITOR") || Deno.env.get("VISUAL") || "vi";
+      // Security: reject suspicious characters that could indicate command injection
+      if (/[;&|`$\n\r]/.test(rawEditor)) {
+        printError(`Refusing to execute suspicious $EDITOR value: "${rawEditor}"`);
+        return;
+      }
+      // Extract just the binary name for validation
+      const editorBinary = rawEditor.split(/\s+/)[0];
 
-      new Deno.Command(editor, { args: [configPath], stdin: "inherit", stdout: "inherit", stderr: "inherit" }).outputSync();
+      new Deno.Command(editorBinary, { args: [configPath], stdin: "inherit", stdout: "inherit", stderr: "inherit" }).outputSync();
 
       // Re-validate after edit
       const manager = await createManager();

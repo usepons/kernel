@@ -219,6 +219,8 @@ export class LifecycleManager {
   private pendingRpc = new Map<string, PendingRpc>();
   private healthTimers = new Map<string, ReturnType<typeof setInterval>>();
   private pendingReady = new Map<string, PendingReady>();
+  private stderrBuffers = new Map<string, string>();
+  private spawnTimestamps = new Map<string, number>();
 
   private readonly denoConfigPath: string | null;
 
@@ -267,7 +269,12 @@ export class LifecycleManager {
       this.logger.debug({ module: manifest.id, source: 'stdout' }, new TextDecoder().decode(d).trim());
     });
     proc.stderr?.on('data', (d: Uint8Array) => {
-      this.logger.warn({ module: manifest.id, source: 'stderr' }, new TextDecoder().decode(d).trim());
+      const text = new TextDecoder().decode(d).trim();
+      if (text) {
+        // Keep last stderr output for exit diagnostics
+        this.stderrBuffers.set(manifest.id, text);
+        this.logger.warn({ module: manifest.id, source: 'stderr' }, text);
+      }
     });
 
     proc.on('message', (raw) => {
@@ -286,6 +293,7 @@ export class LifecycleManager {
     });
 
     this.registry.setProcess(manifest.id, proc);
+    this.spawnTimestamps.set(manifest.id, Date.now());
     this.logger.debug({ module: manifest.id, pid: proc.pid }, 'Module process spawned');
 
     // Security: scope config to module's own section only (never send full config)
@@ -671,7 +679,25 @@ export class LifecycleManager {
     this.cleanupModuleRpcs(moduleId);
 
     const restarts = this.registry.incrementRestarts(moduleId);
-    this.logger.warn({ module: moduleId, code, signal, restarts }, 'Module exited unexpectedly');
+    const lastStderr = this.stderrBuffers.get(moduleId);
+    this.stderrBuffers.delete(moduleId);
+
+    const spawnTime = this.spawnTimestamps.get(moduleId);
+    this.spawnTimestamps.delete(moduleId);
+    const aliveMs = spawnTime ? Date.now() - spawnTime : null;
+    const instant = aliveMs !== null && aliveMs < 1000;
+
+    let detail = '';
+    if (lastStderr) {
+      detail = lastStderr;
+    } else if (instant) {
+      detail = `exited after ${aliveMs}ms with no output — check the module entry point (runner) and its dependencies`;
+    }
+
+    this.logger.warn(
+      { module: moduleId, code, signal, restarts, ...(aliveMs !== null ? { aliveMs } : {}), ...(lastStderr ? { lastStderr } : {}) },
+      detail ? `Module exited unexpectedly — ${detail}` : 'Module exited unexpectedly',
+    );
 
     if (restarts > MAX_RESTARTS) {
       this.registry.setStatus(moduleId, 'crashed');
@@ -759,8 +785,9 @@ export class LifecycleManager {
     const childEnv = { ...Deno.env.toObject(), ...env };
 
     // Security: translate manifest permissions to Deno flags (never --allow-all)
+    const moduleDir = dirname(runnerPath);
     const denoPerms = manifest.permissions
-      ? translateToDenoFlags(manifest.permissions as ModulePermissions)
+      ? translateToDenoFlags(manifest.permissions as ModulePermissions, moduleDir)
       : ['--deny-all'];
     // Prefer the module's own deno.json (needed for nodeModulesDir, import maps, etc.)
     const moduleDenoConfig = join(dirname(runnerPath), 'deno.json');

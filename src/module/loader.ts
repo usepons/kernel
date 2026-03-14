@@ -6,7 +6,7 @@
  * ready to be spawned by the LifecycleManager.
  */
 
-import { join } from 'jsr:@std/path@^1';
+import { join, resolve } from 'jsr:@std/path@^1';
 import type { ModuleManifest } from 'jsr:@pons/sdk@^0.2';
 import { createLogger, type KernelLogger } from '../logs/logger.ts';
 import { modulePermissionsSchema, computeManifestHash } from '../security/permissions.ts';
@@ -98,8 +98,14 @@ export class ModuleLoader {
       } catch { /* deno.json not present */ }
 
       const entrypoint = manifest.entrypoint || 'runner.ts';
-      const entryJs = join(moduleDir, entrypoint.replace(/\.ts$/, '.js'));
-      const entryTs = join(moduleDir, entrypoint);
+      // Security: verify entrypoint resolves within the module directory (prevent path traversal)
+      const resolvedEntry = resolve(moduleDir, entrypoint);
+      if (!resolvedEntry.startsWith(moduleDir + '/') && resolvedEntry !== moduleDir) {
+        this.logger.error({ module: manifest.id, entrypoint }, 'Entry point escapes module directory — skipping');
+        continue;
+      }
+      const entryJs = resolvedEntry.replace(/\.ts$/, '.js');
+      const entryTs = resolvedEntry;
       const entryJsExists = (() => { try { Deno.statSync(entryJs); return true; } catch { return false; } })();
       const entryTsExists = (() => { try { Deno.statSync(entryTs); return true; } catch { return false; } })();
       const runnerPath = entryJsExists ? entryJs : entryTsExists ? entryTs : null;

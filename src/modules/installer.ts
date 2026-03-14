@@ -66,7 +66,12 @@ function extractModuleName(nameOrUrl: string): string {
   const segments = nameOrUrl.replace(/\.git$/, "").split("/");
   const last = segments[segments.length - 1];
   // Strip common prefixes like "module-"
-  return last.replace(/^module-/, "");
+  const name = last.replace(/^module-/, "");
+  // Security: reject path traversal and invalid characters
+  if (!name || !/^[a-zA-Z0-9_-]+$/.test(name)) {
+    throw new Error(`Invalid module name derived from URL: "${name}". Module names must be alphanumeric with hyphens/underscores only.`);
+  }
+  return name;
 }
 
 /**
@@ -313,6 +318,24 @@ export async function installModule(
 
   // --- Git URL (contains :// or ends with .git) ---
   if (nameOrUrl.includes("://") || nameOrUrl.endsWith(".git")) {
+    // Security: validate URL scheme — only allow safe git transport protocols
+    const ALLOWED_GIT_SCHEMES = ['https:', 'http:', 'ssh:', 'git:'];
+    if (nameOrUrl.includes("://")) {
+      try {
+        const parsed = new URL(nameOrUrl);
+        if (!ALLOWED_GIT_SCHEMES.includes(parsed.protocol)) {
+          printError(`Unsupported git URL scheme: ${parsed.protocol}. Allowed: ${ALLOWED_GIT_SCHEMES.join(', ')}`);
+          return false;
+        }
+      } catch {
+        // Not a valid URL but may be an SSH shorthand (git@host:repo.git)
+        if (!nameOrUrl.match(/^[\w.-]+@[\w.-]+:[\w./-]+\.git$/)) {
+          printError(`Invalid git URL: ${nameOrUrl}`);
+          return false;
+        }
+      }
+    }
+
     const moduleName = extractModuleName(nameOrUrl);
     const targetDir = join(modulesDir, moduleName);
 

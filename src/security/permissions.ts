@@ -89,12 +89,19 @@ function binaryExists(name: string): boolean {
  * Convert declared permissions into Deno CLI permission flags.
  * Never produces --allow-all.
  *
+ * Relative paths in read/write permissions are resolved against moduleDir
+ * (the directory containing the module's runner). This lets modules declare
+ * "." to mean "my own directory" and have it translate to an absolute path.
+ *
  * Run permissions are resolved lazily: binaries not found on the host
  * are silently omitted from --allow-run. This lets modules declare all
  * binaries they *may* call without requiring every one to be installed.
  */
-export function translateToDenoFlags(permissions: ModulePermissions): string[] {
+export function translateToDenoFlags(permissions: ModulePermissions, moduleDir?: string): string[] {
   const flags: string[] = [];
+
+  const resolvePaths = (paths: string[]): string[] =>
+    moduleDir ? paths.map(p => p.startsWith('/') ? p : join(moduleDir, p)) : paths;
 
   if (permissions.net && permissions.net.length > 0) {
     flags.push(`--allow-net=${permissions.net.join(',')}`);
@@ -103,13 +110,13 @@ export function translateToDenoFlags(permissions: ModulePermissions): string[] {
   }
 
   if (permissions.read && permissions.read.length > 0) {
-    flags.push(`--allow-read=${permissions.read.join(',')}`);
+    flags.push(`--allow-read=${resolvePaths(permissions.read).join(',')}`);
   } else {
     flags.push('--deny-read');
   }
 
   if (permissions.write && permissions.write.length > 0) {
-    flags.push(`--allow-write=${permissions.write.join(',')}`);
+    flags.push(`--allow-write=${resolvePaths(permissions.write).join(',')}`);
   } else {
     flags.push('--deny-write');
   }
@@ -121,7 +128,13 @@ export function translateToDenoFlags(permissions: ModulePermissions): string[] {
   }
 
   if (permissions.run && permissions.run.length > 0) {
+    // Security: warn about shell interpreters that effectively bypass the sandbox
+    const DANGEROUS_BINARIES = new Set(['sh', 'bash', 'zsh', 'fish', 'csh', 'dash', 'cmd', 'powershell', 'pwsh', 'python', 'python3', 'node', 'ruby', 'perl']);
     const available = permissions.run.filter(binaryExists);
+    const dangerous = available.filter(b => DANGEROUS_BINARIES.has(b));
+    if (dangerous.length > 0) {
+      console.warn(`[security] Module requests shell interpreters: ${dangerous.join(', ')} — these can bypass Deno sandbox restrictions`);
+    }
     if (available.length > 0) {
       flags.push(`--allow-run=${available.join(',')}`);
     } else {
@@ -188,7 +201,7 @@ export class PermissionStore {
       modules: this.data,
       serviceProviders: this.serviceProviders,
     });
-    Deno.writeTextFileSync(this.filePath, content);
+    Deno.writeTextFileSync(this.filePath, content, { mode: 0o600 });
   }
 
   /**

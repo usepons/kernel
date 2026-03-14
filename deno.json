@@ -11,7 +11,7 @@
   },
 
   "tasks": {
-    "dev": "deno run --allow-all --watch src/index.ts",
+    "dev": "deno run --allow-all --unstable-worker-options --watch src/index.ts",
     "start": "deno run --allow-all src/index.ts"
   }
 }
