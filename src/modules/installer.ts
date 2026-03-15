@@ -13,6 +13,7 @@ import chalk from "npm:chalk@^5.6.2";
 import { getPonsHome } from "@pons/sdk";
 import type { ModuleManifest } from "@pons/sdk";
 import { printError, printWarning } from "../formatters.ts";
+import { auditModuleSource, formatAuditWarning } from "./audit.ts";
 import { validatePermissions, computeManifestHash, PermissionStore } from '../security/permissions.ts';
 import * as prompts from 'npm:@clack/prompts@^0.10.1';
 
@@ -298,6 +299,14 @@ export async function installModule(
         `Linked ${chalk.green(manifest.id)} from ${chalk.dim(localPath)}`,
       );
 
+      // Audit: warn about node: imports that bypass the sandbox
+      const auditFindings = auditModuleSource(localPath);
+      const auditWarning = formatAuditWarning(auditFindings);
+      if (auditWarning) {
+        console.log();
+        console.log(chalk.yellow(auditWarning));
+      }
+
       // Security: approve permissions
       const store = permStore;
       const approved = await displayAndApprovePermissions(manifest, manifestPath, store, autoApprove);
@@ -363,6 +372,14 @@ export async function installModule(
       }
 
       spinner.succeed(`Installed ${chalk.green(moduleName)} from git`);
+
+      // Audit: warn about node: imports that bypass the sandbox
+      const gitAuditFindings = auditModuleSource(targetDir);
+      const gitAuditWarning = formatAuditWarning(gitAuditFindings);
+      if (gitAuditWarning) {
+        console.log();
+        console.log(chalk.yellow(gitAuditWarning));
+      }
 
       // Security: approve permissions
       const manifest = JSON.parse(Deno.readTextFileSync(manifestPath)) as ModuleManifest;
@@ -454,6 +471,14 @@ export async function installModule(
     spinner.succeed(
       `Installed ${chalk.green(moduleName)} ${chalk.dim(`v${version}`)} from JSR`,
     );
+
+    // Audit: warn about node: imports that bypass the sandbox
+    const jsrAuditFindings = auditModuleSource(targetDir);
+    const jsrAuditWarning = formatAuditWarning(jsrAuditFindings);
+    if (jsrAuditWarning) {
+      console.log();
+      console.log(chalk.yellow(jsrAuditWarning));
+    }
 
     // Security: approve permissions
     const store = permStore;
