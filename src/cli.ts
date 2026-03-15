@@ -380,6 +380,24 @@ export function init(program: Command): void {
       } catch {
         console.log(`Gateway:        not reachable at ${getGatewayUrl(gwConfig)}`);
       }
+
+      // Count pending permission requests
+      try {
+        const port = Deno.readTextFileSync(join(home, '.runtime', 'kernel.port')).trim();
+        const token = Deno.readTextFileSync(join(home, '.runtime', 'kernel.token')).trim();
+        const res = await fetch(`http://127.0.0.1:${port}/api/permissions/list`, {
+          headers: { 'Authorization': `Bearer ${token}` },
+        });
+        if (res.ok) {
+          const data = await res.json();
+          const pendingCount = Object.values(data.modules ?? data).reduce(
+            (sum: number, m: any) => sum + (m.pending?.length || 0), 0
+          );
+          if (pendingCount > 0) {
+            console.log(chalk.yellow(`Pending permissions: ${pendingCount} request(s) (run 'pons permissions pending')`));
+          }
+        }
+      } catch { /* kernel API not available */ }
     });
 
   /* ---- kernel logs ---- */
