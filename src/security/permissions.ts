@@ -21,8 +21,7 @@ export interface ModulePermissions {
   write?: string[];
   env?: string[];
   run?: string[];
-  services?: string[];
-  topics?: string[];
+  sys?: string[];
 }
 
 export interface GrantedPermission {
@@ -49,10 +48,9 @@ export const modulePermissionsSchema = z.object({
   net: stringArraySchema,
   read: stringArraySchema,
   write: stringArraySchema,
-  env: stringArraySchema,
+  env: z.array(z.string().refine(s => !s.includes('*'), { message: 'Glob patterns not allowed in env — use exact names' })).optional().default([]),
   run: stringArraySchema,
-  services: stringArraySchema,
-  topics: stringArraySchema,
+  sys: stringArraySchema,
 }).strict();
 
 /**
@@ -100,8 +98,13 @@ function binaryExists(name: string): boolean {
 export function translateToDenoFlags(permissions: ModulePermissions, moduleDir?: string): string[] {
   const flags: string[] = [];
 
+  const home = Deno.env.get('HOME') || Deno.env.get('USERPROFILE') || '';
+  const expandTilde = (p: string): string => p.startsWith('~/') ? join(home, p.slice(2)) : p;
   const resolvePaths = (paths: string[]): string[] =>
-    moduleDir ? paths.map(p => p.startsWith('/') ? p : join(moduleDir, p)) : paths;
+    paths.map(p => {
+      const expanded = expandTilde(p);
+      return expanded.startsWith('/') ? expanded : (moduleDir ? join(moduleDir, expanded) : expanded);
+    });
 
   if (permissions.net && permissions.net.length > 0) {
     flags.push(`--allow-net=${permissions.net.join(',')}`);
@@ -122,7 +125,23 @@ export function translateToDenoFlags(permissions: ModulePermissions, moduleDir?:
   }
 
   if (permissions.env && permissions.env.length > 0) {
-    flags.push(`--allow-env=${permissions.env.join(',')}`);
+    // Expand glob patterns (e.g. "TELEGRAM_*") against actual env vars
+    const allEnvKeys = Object.keys(Deno.env.toObject());
+    const resolved = new Set<string>();
+    for (const pattern of permissions.env) {
+      if (pattern.includes('*')) {
+        const prefix = pattern.slice(0, pattern.indexOf('*'));
+        for (const key of allEnvKeys) {
+          if (key.startsWith(prefix)) resolved.add(key);
+        }
+      } else {
+        resolved.add(pattern);
+      }
+    }
+    // Always allow HOME/USERPROFILE so modules can resolve ~/.pons paths
+    resolved.add('HOME');
+    resolved.add('USERPROFILE');
+    flags.push(`--allow-env=${[...resolved].join(',')}`);
   } else {
     flags.push('--deny-env');
   }
