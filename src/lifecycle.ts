@@ -9,7 +9,7 @@
  *   2. RPC — direct IPC routing (non-persistent, exactly-once, timeout on failure)
  */
 
-import { dirname, join } from 'jsr:@std/path@^1';
+import { dirname, join, resolve } from 'jsr:@std/path@^1';
 import type { DiscoveredModule } from './module/loader.ts';
 import type { KernelLogger } from './logs/logger.ts';
 import { writeModuleLog, writeModuleLogGroup } from './logs/logger.ts';
@@ -28,11 +28,31 @@ const VALID_MODULE_TYPES = new Set([
   'rpc_request', 'rpc_response',
 ]);
 
-/** Lightweight validation that incoming IPC data is a known ModuleMessage. */
+/** Validate incoming IPC data is a known ModuleMessage with required fields. */
 export function validateModuleMessage(raw: unknown): ModuleMessage | null {
   if (raw == null || typeof raw !== 'object') return null;
   const msg = raw as Record<string, unknown>;
   if (typeof msg.type !== 'string' || !VALID_MODULE_TYPES.has(msg.type)) return null;
+
+  // Validate required fields per message type
+  switch (msg.type) {
+    case 'rpc_request':
+      if (typeof msg.id !== 'string' || typeof msg.service !== 'string' || typeof msg.method !== 'string') return null;
+      break;
+    case 'rpc_response':
+      if (typeof msg.id !== 'string') return null;
+      break;
+    case 'publish':
+      if (typeof msg.topic !== 'string') return null;
+      break;
+    case 'call':
+      if (typeof msg.id !== 'string' || typeof msg.method !== 'string') return null;
+      break;
+    case 'call:response':
+      if (typeof msg.id !== 'string') return null;
+      break;
+  }
+
   return raw as ModuleMessage;
 }
 
@@ -325,7 +345,7 @@ export class LifecycleManager {
         const timer = setTimeout(resolve, SHUTDOWN_GRACE_MS);
         entry.process?.once('exit', () => { clearTimeout(timer); resolve(); });
       });
-      if (entry.process.connected) {
+      if (entry.process?.connected) {
         entry.process.kill('SIGKILL');
       }
     }
@@ -363,6 +383,23 @@ export class LifecycleManager {
 
     this.logger.info({ module: newManifest.id }, 'Hot-swap: spawning new process');
     await this.spawn(newRunnerPath, newManifest, env);
+  }
+
+  async restartWithUpdatedPermissions(moduleId: string): Promise<void> {
+    const entry = this.registry.get(moduleId);
+    if (!entry) return;
+
+    this.logger.info({ module: moduleId }, 'Restarting module with updated permissions');
+
+    // Kill existing process
+    await this.kill(moduleId, 'permission-update');
+
+    // Re-spawn with updated flags (forkProcess reads from store)
+    const { manifest } = entry;
+    const modulesDir = resolve(this.initPayload.projectRoot, 'modules');
+    const entrypoint = manifest.entrypoint || 'runner.ts';
+    const runnerPath = resolve(modulesDir, manifest.id, entrypoint);
+    await this.spawn(runnerPath, manifest);
   }
 
   // ─── Message Routing ─────────────────────────────────────────
@@ -786,8 +823,9 @@ export class LifecycleManager {
 
     // Security: translate manifest permissions to Deno flags (never --allow-all)
     const moduleDir = dirname(runnerPath);
-    const denoPerms = manifest.permissions
-      ? translateToDenoFlags(manifest.permissions as ModulePermissions, moduleDir)
+    const effective = this.permissionStore?.getEffectivePermissions(manifest.id);
+    const denoPerms = effective
+      ? translateToDenoFlags(effective, moduleDir)
       : ['--deny-all'];
     // Prefer the module's own deno.json (needed for nodeModulesDir, import maps, etc.)
     const moduleDenoConfig = join(dirname(runnerPath), 'deno.json');

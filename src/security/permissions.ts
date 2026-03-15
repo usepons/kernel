@@ -106,48 +106,36 @@ export function translateToDenoFlags(permissions: ModulePermissions, moduleDir?:
       return expanded.startsWith('/') ? expanded : (moduleDir ? join(moduleDir, expanded) : expanded);
     });
 
+  // net
   if (permissions.net && permissions.net.length > 0) {
     flags.push(`--allow-net=${permissions.net.join(',')}`);
   } else {
     flags.push('--deny-net');
   }
 
+  // read
   if (permissions.read && permissions.read.length > 0) {
     flags.push(`--allow-read=${resolvePaths(permissions.read).join(',')}`);
   } else {
     flags.push('--deny-read');
   }
 
+  // write
   if (permissions.write && permissions.write.length > 0) {
     flags.push(`--allow-write=${resolvePaths(permissions.write).join(',')}`);
   } else {
     flags.push('--deny-write');
   }
 
+  // env — exact names only, no globs
   if (permissions.env && permissions.env.length > 0) {
-    // Expand glob patterns (e.g. "TELEGRAM_*") against actual env vars
-    const allEnvKeys = Object.keys(Deno.env.toObject());
-    const resolved = new Set<string>();
-    for (const pattern of permissions.env) {
-      if (pattern.includes('*')) {
-        const prefix = pattern.slice(0, pattern.indexOf('*'));
-        for (const key of allEnvKeys) {
-          if (key.startsWith(prefix)) resolved.add(key);
-        }
-      } else {
-        resolved.add(pattern);
-      }
-    }
-    // Always allow HOME/USERPROFILE so modules can resolve ~/.pons paths
-    resolved.add('HOME');
-    resolved.add('USERPROFILE');
-    flags.push(`--allow-env=${[...resolved].join(',')}`);
+    flags.push(`--allow-env=${permissions.env.join(',')}`);
   } else {
     flags.push('--deny-env');
   }
 
+  // run — only include binaries found in PATH
   if (permissions.run && permissions.run.length > 0) {
-    // Security: warn about shell interpreters that effectively bypass the sandbox
     const DANGEROUS_BINARIES = new Set(['sh', 'bash', 'zsh', 'fish', 'csh', 'dash', 'cmd', 'powershell', 'pwsh', 'python', 'python3', 'node', 'ruby', 'perl']);
     const available = permissions.run.filter(binaryExists);
     const dangerous = available.filter(b => DANGEROUS_BINARIES.has(b));
@@ -161,6 +149,13 @@ export function translateToDenoFlags(permissions: ModulePermissions, moduleDir?:
     }
   } else {
     flags.push('--deny-run');
+  }
+
+  // sys — specific keys
+  if (permissions.sys && permissions.sys.length > 0) {
+    flags.push(`--allow-sys=${permissions.sys.join(',')}`);
+  } else {
+    flags.push('--deny-sys');
   }
 
   return flags;
