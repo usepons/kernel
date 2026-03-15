@@ -178,14 +178,49 @@ export function computeManifestHash(manifestPath: string): string {
   return encodeHex(new Uint8Array(hash));
 }
 
+// ─── Extended Permission Types ──────────────────────────────────
+
+export interface ModulePermissionEntry {
+  base: ModulePermissions;
+  baseManifestHash: string;
+  baseGrantedAt: string;
+  firstSpawnAt?: string;
+  dynamic: ApprovedDynamicPermission[];
+  pending: PendingRequest[];
+  denied: DeniedRequest[];
+}
+
+export interface ApprovedDynamicPermission {
+  permissions: Partial<ModulePermissions>;
+  reason?: string;
+  grantedAt: string;
+}
+
+export interface PendingRequest {
+  id: string;
+  permissions: Partial<ModulePermissions>;
+  reason?: string;
+  requestedAt: string;
+}
+
+export interface DeniedRequest {
+  permissions: Partial<ModulePermissions>;
+  reason?: string;
+  deniedAt: string;
+}
+
 // ─── Permission Store ───────────────────────────────────────────
 
 /**
  * Persistent store for user-approved module permissions.
  * Backed by ~/.pons/permissions.yaml.
+ *
+ * Supports base permissions (from manifest approval), dynamic permissions
+ * (requested at runtime), pending requests (queued for user approval),
+ * and denied requests (to prevent re-prompting).
  */
 export class PermissionStore {
-  private data: Record<string, GrantedPermission> = {};
+  private data: Record<string, ModulePermissionEntry> = {};
   private serviceProviders: Record<string, string> = {};
   private readonly filePath: string;
 
@@ -204,9 +239,29 @@ export class PermissionStore {
 
     try {
       const raw = Deno.readTextFileSync(this.filePath);
-      const parsed = parseYaml(raw) as { modules?: Record<string, GrantedPermission>; serviceProviders?: Record<string, string> } | null;
-      this.data = parsed?.modules ?? {};
+      // deno-lint-ignore no-explicit-any
+      const parsed = parseYaml(raw) as { modules?: Record<string, any>; serviceProviders?: Record<string, string> } | null;
+      const rawModules = parsed?.modules ?? {};
       this.serviceProviders = parsed?.serviceProviders ?? {};
+
+      // Migrate: handle both old format and new format
+      this.data = {};
+      for (const [moduleId, entry] of Object.entries(rawModules)) {
+        if (entry && 'base' in entry) {
+          // New format — use as-is
+          this.data[moduleId] = entry as ModulePermissionEntry;
+        } else if (entry && 'permissions' in entry) {
+          // Old format — migrate { permissions, manifestHash, grantedAt }
+          this.data[moduleId] = {
+            base: entry.permissions as ModulePermissions,
+            baseManifestHash: entry.manifestHash as string,
+            baseGrantedAt: entry.grantedAt as string,
+            dynamic: [],
+            pending: [],
+            denied: [],
+          };
+        }
+      }
     } catch {
       this.data = {};
       this.serviceProviders = {};
@@ -220,7 +275,9 @@ export class PermissionStore {
       modules: this.data,
       serviceProviders: this.serviceProviders,
     });
-    Deno.writeTextFileSync(this.filePath, content, { mode: 0o600 });
+    const tmpPath = this.filePath + '.tmp';
+    Deno.writeTextFileSync(tmpPath, content, { mode: 0o600 });
+    Deno.renameSync(tmpPath, this.filePath);
   }
 
   /**
@@ -231,8 +288,18 @@ export class PermissionStore {
     this.load();
   }
 
+  /**
+   * Backward-compatible accessor. Returns a GrantedPermission-shaped object
+   * so existing code (enforcer, lifecycle, cli) continues to work.
+   */
   getApproved(moduleId: string): GrantedPermission | undefined {
-    return this.data[moduleId];
+    const entry = this.data[moduleId];
+    if (!entry) return undefined;
+    return {
+      permissions: entry.base,
+      manifestHash: entry.baseManifestHash,
+      grantedAt: entry.baseGrantedAt,
+    };
   }
 
   isApproved(moduleId: string): boolean {
@@ -241,9 +308,12 @@ export class PermissionStore {
 
   approve(moduleId: string, permissions: ModulePermissions, manifestHash: string): void {
     this.data[moduleId] = {
-      permissions,
-      manifestHash,
-      grantedAt: new Date().toISOString(),
+      base: permissions,
+      baseManifestHash: manifestHash,
+      baseGrantedAt: new Date().toISOString(),
+      dynamic: [],
+      pending: [],
+      denied: [],
     };
     this.save();
   }
@@ -259,16 +329,27 @@ export class PermissionStore {
         if (provider === moduleId) delete this.serviceProviders[svc];
       }
     } else {
-      const perms = this.data[moduleId].permissions;
+      const entry = this.data[moduleId];
       const key = permissionType as keyof ModulePermissions;
-      if (!(key in perms) || !Array.isArray(perms[key])) return false;
 
-      if (value) {
-        // Revoke specific value from a permission type
-        perms[key] = perms[key]!.filter((v: string) => v !== value);
-      } else {
-        // Revoke entire permission type
-        perms[key] = [];
+      // Remove from base permissions
+      if (key in entry.base && Array.isArray(entry.base[key])) {
+        if (value) {
+          entry.base[key] = entry.base[key]!.filter((v: string) => v !== value);
+        } else {
+          entry.base[key] = [];
+        }
+      }
+
+      // Remove from dynamic permissions
+      for (const dyn of entry.dynamic) {
+        if (key in dyn.permissions && Array.isArray(dyn.permissions[key])) {
+          if (value) {
+            dyn.permissions[key] = dyn.permissions[key]!.filter((v: string) => v !== value);
+          } else {
+            dyn.permissions[key] = [];
+          }
+        }
       }
     }
 
@@ -277,12 +358,228 @@ export class PermissionStore {
   }
 
   getManifestHash(moduleId: string): string | null {
-    return this.data[moduleId]?.manifestHash ?? null;
+    return this.data[moduleId]?.baseManifestHash ?? null;
   }
+
+  // ─── Effective Permissions ──────────────────────────────────────
+
+  /**
+   * Compute the effective permissions for a module by merging base
+   * permissions with all approved dynamic permissions.
+   */
+  getEffectivePermissions(moduleId: string): ModulePermissions | null {
+    const entry = this.data[moduleId];
+    if (!entry) return null;
+
+    const effective: ModulePermissions = {};
+    const fields: (keyof ModulePermissions)[] = ['net', 'read', 'write', 'env', 'run', 'sys'];
+
+    for (const field of fields) {
+      const baseValues = entry.base[field] || [];
+      const dynamicValues = entry.dynamic.flatMap(d => d.permissions[field] || []);
+      const merged = [...new Set([...baseValues, ...dynamicValues])];
+      if (merged.length > 0) effective[field] = merged;
+    }
+
+    return effective;
+  }
+
+  // ─── Dynamic Permissions ────────────────────────────────────────
+
+  /**
+   * Add an approved dynamic permission to a module.
+   */
+  addDynamicPermission(moduleId: string, permissions: Partial<ModulePermissions>, reason?: string): void {
+    const entry = this.data[moduleId];
+    if (!entry) return;
+
+    entry.dynamic.push({
+      permissions,
+      reason,
+      grantedAt: new Date().toISOString(),
+    });
+    this.save();
+  }
+
+  // ─── Pending Requests ──────────────────────────────────────────
+
+  /**
+   * Add a pending permission request for user approval.
+   * Returns the created PendingRequest with a generated UUID.
+   */
+  addPendingRequest(moduleId: string, permissions: Partial<ModulePermissions>, reason?: string): PendingRequest {
+    const entry = this.data[moduleId];
+    if (!entry) throw new Error(`Module ${moduleId} is not approved`);
+
+    const request: PendingRequest = {
+      id: crypto.randomUUID(),
+      permissions,
+      reason,
+      requestedAt: new Date().toISOString(),
+    };
+    entry.pending.push(request);
+    this.save();
+    return request;
+  }
+
+  /**
+   * Get pending requests. If moduleId is provided, returns only that module's
+   * pending requests. Otherwise returns all pending across all modules.
+   */
+  getPendingRequests(moduleId?: string): Record<string, PendingRequest[]> {
+    if (moduleId) {
+      const entry = this.data[moduleId];
+      if (!entry) return {};
+      return { [moduleId]: entry.pending };
+    }
+
+    const result: Record<string, PendingRequest[]> = {};
+    for (const [id, entry] of Object.entries(this.data)) {
+      if (entry.pending.length > 0) {
+        result[id] = entry.pending;
+      }
+    }
+    return result;
+  }
+
+  /**
+   * Resolve a pending request by granting or denying it.
+   * Returns true if the request was found and resolved.
+   */
+  resolvePending(moduleId: string, requestId: string, decision: 'grant' | 'deny'): boolean {
+    const entry = this.data[moduleId];
+    if (!entry) return false;
+
+    const idx = entry.pending.findIndex(p => p.id === requestId);
+    if (idx === -1) return false;
+
+    const request = entry.pending[idx];
+    entry.pending.splice(idx, 1);
+
+    if (decision === 'grant') {
+      this.addDynamicPermission(moduleId, request.permissions, request.reason);
+      this.removeDenied(moduleId, request.permissions);
+    } else {
+      entry.denied.push({
+        permissions: request.permissions,
+        reason: request.reason,
+        deniedAt: new Date().toISOString(),
+      });
+      this.save();
+    }
+
+    return true;
+  }
+
+  // ─── Denied Requests ───────────────────────────────────────────
+
+  /**
+   * Check if any value in the requested permissions has been previously denied.
+   * Uses per-value matching: returns true if ANY requested value appears in
+   * ANY denied entry's corresponding field.
+   */
+  isDenied(moduleId: string, permissions: Partial<ModulePermissions>): boolean {
+    const entry = this.data[moduleId];
+    if (!entry || entry.denied.length === 0) return false;
+
+    const fields: (keyof ModulePermissions)[] = ['net', 'read', 'write', 'env', 'run', 'sys'];
+    for (const denied of entry.denied) {
+      for (const field of fields) {
+        const deniedValues = denied.permissions[field];
+        const requestedValues = permissions[field];
+        if (deniedValues && requestedValues) {
+          for (const val of requestedValues) {
+            if (deniedValues.includes(val)) return true;
+          }
+        }
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Remove denied entries that match the given permissions.
+   * For each denied entry, removes values that match. If a denied entry
+   * becomes empty (no values in any field), it is removed entirely.
+   */
+  removeDenied(moduleId: string, permissions: Partial<ModulePermissions>): void {
+    const entry = this.data[moduleId];
+    if (!entry) return;
+
+    const fields: (keyof ModulePermissions)[] = ['net', 'read', 'write', 'env', 'run', 'sys'];
+
+    entry.denied = entry.denied.filter(denied => {
+      for (const field of fields) {
+        const toRemove = permissions[field];
+        if (toRemove && denied.permissions[field]) {
+          denied.permissions[field] = denied.permissions[field]!.filter(
+            (v: string) => !toRemove.includes(v)
+          );
+        }
+      }
+      // Keep the denied entry only if it still has at least one value
+      return fields.some(f => denied.permissions[f] && denied.permissions[f]!.length > 0);
+    });
+
+    this.save();
+  }
+
+  /**
+   * Find an existing pending request that already covers all requested permissions.
+   * Returns the matching PendingRequest, or null if none found.
+   */
+  findExistingPending(moduleId: string, permissions: Partial<ModulePermissions>): PendingRequest | null {
+    const entry = this.data[moduleId];
+    if (!entry) return null;
+
+    const fields: (keyof ModulePermissions)[] = ['net', 'read', 'write', 'env', 'run', 'sys'];
+
+    for (const pending of entry.pending) {
+      let allCovered = true;
+      for (const field of fields) {
+        const requestedValues = permissions[field];
+        if (!requestedValues || requestedValues.length === 0) continue;
+        const pendingValues = pending.permissions[field];
+        if (!pendingValues) { allCovered = false; break; }
+        for (const val of requestedValues) {
+          if (!pendingValues.includes(val)) { allCovered = false; break; }
+        }
+        if (!allCovered) break;
+      }
+      if (allCovered) return pending;
+    }
+    return null;
+  }
+
+  // ─── First Spawn Tracking ──────────────────────────────────────
+
+  /**
+   * Record the first spawn timestamp for a module (used for onInstall hook).
+   */
+  setFirstSpawnAt(moduleId: string): void {
+    const entry = this.data[moduleId];
+    if (!entry) return;
+    entry.firstSpawnAt = new Date().toISOString();
+    this.save();
+  }
+
+  /**
+   * Get the first spawn timestamp for a module, or null if not yet spawned.
+   */
+  getFirstSpawnAt(moduleId: string): string | null {
+    return this.data[moduleId]?.firstSpawnAt ?? null;
+  }
+
+  // ─── Service Providers ─────────────────────────────────────────
 
   /** Get the module that is approved to provide a service. */
   getServiceProvider(service: string): string | null {
     return this.serviceProviders[service] ?? null;
+  }
+
+  /** Alias for getServiceProvider. */
+  resolveServiceProvider(service: string): string | null {
+    return this.getServiceProvider(service);
   }
 
   /** Register a module as the approved provider of a service. Returns false if already claimed. */
@@ -294,9 +591,19 @@ export class PermissionStore {
     return true;
   }
 
-  /** List all approved modules and their permissions. */
+  // ─── Backward-Compatible Accessors ─────────────────────────────
+
+  /** List all approved modules and their permissions (backward-compatible). */
   listAll(): Record<string, GrantedPermission> {
-    return { ...this.data };
+    const result: Record<string, GrantedPermission> = {};
+    for (const [moduleId, entry] of Object.entries(this.data)) {
+      result[moduleId] = {
+        permissions: entry.base,
+        manifestHash: entry.baseManifestHash,
+        grantedAt: entry.baseGrantedAt,
+      };
+    }
+    return result;
   }
 
   /** Get all module IDs that have approved permissions. */
