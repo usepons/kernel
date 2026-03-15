@@ -6,11 +6,19 @@
  */
 
 import type { KernelLogger } from '../logs/logger.ts';
-import type { ModulePermissions, SecurityViolation, SecurityViolationType, PermissionStore } from './permissions.ts';
+import type { SecurityViolation, SecurityViolationType, PermissionStore } from './permissions.ts';
+
+/** IPC capabilities a module declares (services it may call, topics it may use). */
+export interface ModuleCapabilities {
+  services?: string[];
+  topics?: string[];
+}
 
 // ─── SecurityEnforcer ──────────────────────────────────────────
 
 export class SecurityEnforcer {
+  private readonly moduleCapabilities = new Map<string, ModuleCapabilities>();
+
   constructor(
     private readonly store: PermissionStore,
     private readonly logger: KernelLogger,
@@ -25,9 +33,9 @@ export class SecurityEnforcer {
   checkRpc(
     callerModuleId: string,
     targetService: string,
-    callerPermissions: ModulePermissions,
+    callerCapabilities: ModuleCapabilities,
   ): SecurityViolation | null {
-    const allowed = callerPermissions.services?.includes(targetService) ?? false;
+    const allowed = callerCapabilities.services?.includes(targetService) ?? false;
     if (allowed) return null;
 
     return {
@@ -49,9 +57,9 @@ export class SecurityEnforcer {
     moduleId: string,
     topic: string,
     direction: 'publish' | 'subscribe',
-    modulePermissions: ModulePermissions,
+    moduleCapabilities: ModuleCapabilities,
   ): SecurityViolation | null {
-    const allowed = modulePermissions.topics?.includes(topic) ?? false;
+    const allowed = moduleCapabilities.topics?.includes(topic) ?? false;
     if (allowed) return null;
 
     return {
@@ -117,11 +125,17 @@ export class SecurityEnforcer {
   // ─── Permission Lookup ───────────────────────────────────────
 
   /**
-   * Look up the approved permissions for a module from the PermissionStore.
-   * Returns null if the module has no approved permissions.
+   * Look up the declared capabilities for a module from the PermissionStore.
+   * Returns null if the module has no approved capabilities.
    */
-  getModulePermissions(moduleId: string): ModulePermissions | null {
-    const granted = this.store.getApproved(moduleId);
-    return granted?.permissions ?? null;
+  getModuleCapabilities(moduleId: string): ModuleCapabilities | null {
+    return this.moduleCapabilities.get(moduleId) ?? null;
+  }
+
+  /**
+   * Register the declared capabilities for a module.
+   */
+  setModuleCapabilities(moduleId: string, capabilities: ModuleCapabilities): void {
+    this.moduleCapabilities.set(moduleId, capabilities);
   }
 }

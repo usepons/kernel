@@ -17,9 +17,9 @@ import type { MessageBus } from './messaging/bus.ts';
 import { ModuleRegistry } from './module/registry.ts';
 import type { ChildProcessLike } from './module/registry.ts';
 import type { KernelMessage, ModuleMessage, ModuleManifest } from 'jsr:@pons/sdk@^0.2';
-import type { SecurityEnforcer } from './security/enforcer.ts';
+import type { SecurityEnforcer, ModuleCapabilities } from './security/enforcer.ts';
 import { translateToDenoFlags } from './security/permissions.ts';
-import type { ModulePermissions, PermissionStore } from './security/permissions.ts';
+import type { PermissionStore } from './security/permissions.ts';
 
 
 const VALID_MODULE_TYPES = new Set([
@@ -432,17 +432,22 @@ export class LifecycleManager {
       return;
     }
 
-    // Security: validate topic subscriptions before registering (fail-closed)
+    // Security: register module capabilities and validate topic subscriptions (fail-closed)
+    const capabilities = (manifest as ModuleManifest & { capabilities?: ModuleCapabilities }).capabilities ?? {};
+    if (this.enforcer) {
+      this.enforcer.setModuleCapabilities(moduleId, capabilities);
+    }
+
     const topics = manifest.subscribes ?? [];
     if (this.enforcer && topics.length > 0) {
-      const permissions = this.enforcer.getModulePermissions(moduleId);
-      if (!permissions) {
+      const caps = this.enforcer.getModuleCapabilities(moduleId);
+      if (!caps) {
         this.enforcer.logViolation({ timestamp: new Date().toISOString(), moduleId, type: 'topic', resource: `subscribe:${topics[0]}`, action: 'deny' });
         this.kill(moduleId, 'security-violation');
         return;
       }
       for (const topic of topics) {
-        const violation = this.enforcer.checkTopic(moduleId, topic, 'subscribe', permissions);
+        const violation = this.enforcer.checkTopic(moduleId, topic, 'subscribe', caps);
         if (violation) {
           this.enforcer.logViolation(violation);
           this.kill(moduleId, 'security-violation');
@@ -496,15 +501,15 @@ export class LifecycleManager {
   }
 
   private onPublish(fromModuleId: string, topic: string, payload: unknown): void {
-    // Security: check publish permission (fail-closed: deny if permissions not found)
+    // Security: check publish capability (fail-closed: deny if capabilities not found)
     if (this.enforcer) {
-      const permissions = this.enforcer.getModulePermissions(fromModuleId);
-      if (!permissions) {
+      const capabilities = this.enforcer.getModuleCapabilities(fromModuleId);
+      if (!capabilities) {
         this.enforcer.logViolation({ timestamp: new Date().toISOString(), moduleId: fromModuleId, type: 'topic', resource: `publish:${topic}`, action: 'deny' });
         this.kill(fromModuleId, 'security-violation');
         return;
       }
-      const violation = this.enforcer.checkTopic(fromModuleId, topic, 'publish', permissions);
+      const violation = this.enforcer.checkTopic(fromModuleId, topic, 'publish', capabilities);
       if (violation) {
         this.enforcer.logViolation(violation);
         this.kill(fromModuleId, 'security-violation');
@@ -559,16 +564,16 @@ export class LifecycleManager {
   }
 
   private onRpcRequest(callerModuleId: string, rpcId: string, service: string, method: string, params?: unknown): void {
-    // Security: check RPC permission (fail-closed: deny if permissions not found)
+    // Security: check RPC capability (fail-closed: deny if capabilities not found)
     if (this.enforcer) {
-      const permissions = this.enforcer.getModulePermissions(callerModuleId);
-      if (!permissions) {
+      const capabilities = this.enforcer.getModuleCapabilities(callerModuleId);
+      if (!capabilities) {
         this.enforcer.logViolation({ timestamp: new Date().toISOString(), moduleId: callerModuleId, type: 'rpc', resource: service, action: 'deny' });
-        this.send(callerModuleId, { type: 'rpc_response', id: rpcId, error: `Security violation: no approved permissions` });
+        this.send(callerModuleId, { type: 'rpc_response', id: rpcId, error: `Security violation: no approved capabilities` });
         this.kill(callerModuleId, 'security-violation');
         return;
       }
-      const violation = this.enforcer.checkRpc(callerModuleId, service, permissions);
+      const violation = this.enforcer.checkRpc(callerModuleId, service, capabilities);
       if (violation) {
         this.enforcer.logViolation(violation);
         this.send(callerModuleId, { type: 'rpc_response', id: rpcId, error: `Security violation: not permitted to call service "${service}"` });

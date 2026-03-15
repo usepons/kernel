@@ -9,7 +9,10 @@ import { ModuleLoader } from "./module/loader.ts";
 import type { DiscoveredModule } from "./module/loader.ts";
 import type { KernelConfig, LogLevel } from "./config/types.ts";
 import { PermissionStore } from "./security/permissions.ts";
+import type { ModulePermissions } from "./security/permissions.ts";
 import { SecurityEnforcer } from "./security/enforcer.ts";
+import { generateAndWriteToken } from "./api/auth.ts";
+import { handlePermissionRequest } from "./api/permissions.ts";
 
 function readVersion(): string {
   const baseDir = join(dirname(new URL(import.meta.url).pathname), "..");
@@ -42,7 +45,8 @@ export default class Kernel {
   private enforcer: SecurityEnforcer;
 
   private modules: DiscoveredModule[] = [];
-
+  private apiToken: string = '';
+  private httpServer?: Deno.HttpServer;
 
   constructor(
     private readonly logLevel?: string,
@@ -220,6 +224,27 @@ export default class Kernel {
       });
     });
 
+    // Generate bearer token for HTTP API
+    this.apiToken = generateAndWriteToken(getPonsHome());
+    this.logger.info("API token generated");
+
+    // Start HTTP API server
+    this.httpServer = Deno.serve(
+      { port: 0, hostname: '127.0.0.1', onListen: (addr) => {
+        const portPath = join(getPonsHome(), '.runtime', 'kernel.port');
+        Deno.writeTextFileSync(portPath, String(addr.port));
+        this.logger.info({ port: addr.port }, 'HTTP API listening');
+      }},
+      async (req: Request) => {
+        const permResponse = await handlePermissionRequest(req, this.permissionStore, this.lifecycle, this.apiToken);
+        if (permResponse) return permResponse;
+        return new Response(JSON.stringify({ error: 'Not found' }), {
+          status: 404,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      },
+    );
+
     this.logger.info("Kernel running");
 
     // Write PID file for CLI process management
@@ -265,13 +290,20 @@ export default class Kernel {
   async shutdown(): Promise<void> {
     this.logger.info("─".repeat(60));
     this.logger.info("Kernel shutting down...");
+
+    // Stop HTTP API server
+    if (this.httpServer) {
+      try { this.httpServer.shutdown(); } catch { /* already stopped */ }
+    }
+
     await this.lifecycle.stopAll();
     await this.bus.close();
 
-    // Remove PID file
-    try {
-      Deno.removeSync(join(getPonsHome(), ".runtime", "kernel.pid"));
-    } catch { /* may not exist */ }
+    // Remove runtime files
+    const runtimeDir = join(getPonsHome(), ".runtime");
+    try { Deno.removeSync(join(runtimeDir, "kernel.pid")); } catch { /* may not exist */ }
+    try { Deno.removeSync(join(runtimeDir, "kernel.port")); } catch { /* may not exist */ }
+    try { Deno.removeSync(join(runtimeDir, "kernel.token")); } catch { /* may not exist */ }
 
     Deno.exit(0);
   }
@@ -344,9 +376,78 @@ export default class Kernel {
         if (!resolved) throw new Error(`Service not found: ${service}`);
         return resolved;
       }
+      case "permissions.request": {
+        const { permissions, reason } = params as { permissions: Partial<ModulePermissions>; reason?: string };
+
+        // Check if already granted
+        const effective = this.permissionStore.getEffectivePermissions(moduleId);
+        if (effective && isSubset(permissions, effective)) {
+          return { granted: true };
+        }
+
+        // Check if denied
+        if (this.permissionStore.isDenied(moduleId, permissions)) {
+          return { granted: false, denied: true };
+        }
+
+        // Check for existing pending
+        const existing = this.permissionStore.findExistingPending(moduleId, permissions);
+        if (existing) {
+          return { granted: false, pending: true, requestId: existing.id };
+        }
+
+        // Queue as pending
+        const pending = this.permissionStore.addPendingRequest(moduleId, permissions, reason);
+
+        // Send system notification (best-effort)
+        this.sendSystemNotification(moduleId);
+
+        this.logger.warn({ module: moduleId, requestId: pending.id }, 'Pending permission request');
+
+        return { granted: false, pending: true, requestId: pending.id };
+      }
+      case "permissions.check": {
+        const { permissions } = params as { permissions: Partial<ModulePermissions> };
+        const effective = this.permissionStore.getEffectivePermissions(moduleId);
+
+        if (!effective) return { granted: false, missing: permissions };
+
+        const missing: Partial<ModulePermissions> = {};
+        const fields: (keyof ModulePermissions)[] = ['net', 'read', 'write', 'env', 'run', 'sys'];
+        let allGranted = true;
+
+        for (const field of fields) {
+          const requested = (permissions as Record<string, string[]>)[field];
+          if (!requested) continue;
+          const granted = (effective as Record<string, string[]>)[field] || [];
+          const missingValues = requested.filter((v: string) => !granted.includes(v));
+          if (missingValues.length > 0) {
+            (missing as Record<string, string[]>)[field] = missingValues;
+            allGranted = false;
+          }
+        }
+
+        return { granted: allGranted, missing };
+      }
       default:
         throw new Error(`Unknown kernel method: ${method}`);
     }
+  }
+
+  private sendSystemNotification(moduleId: string): void {
+    try {
+      if (Deno.build.os === 'darwin') {
+        new Deno.Command('osascript', {
+          args: ['-e', `display notification "Module ${moduleId} is waiting for permission approval" with title "Pons"`],
+          stdout: 'null', stderr: 'null',
+        }).outputSync();
+      } else {
+        new Deno.Command('notify-send', {
+          args: ['Pons', `Module ${moduleId} is waiting for permission approval`],
+          stdout: 'null', stderr: 'null',
+        }).outputSync();
+      }
+    } catch { /* notification is best-effort */ }
   }
 
   private printStartupBanner(configSource: string, loadedFiles: string[]) {
@@ -364,4 +465,15 @@ export default class Kernel {
       ],
     }, "Configuration");
   }
+}
+
+function isSubset(requested: Partial<ModulePermissions>, granted: ModulePermissions): boolean {
+  const fields: (keyof ModulePermissions)[] = ['net', 'read', 'write', 'env', 'run', 'sys'];
+  for (const field of fields) {
+    const reqValues = (requested as Record<string, string[]>)[field];
+    if (!reqValues || reqValues.length === 0) continue;
+    const grantedValues = (granted as Record<string, string[]>)[field] || [];
+    if (!reqValues.every((v: string) => grantedValues.includes(v))) return false;
+  }
+  return true;
 }
