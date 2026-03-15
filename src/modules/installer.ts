@@ -10,8 +10,8 @@
 import { dirname, join, resolve } from "jsr:@std/path@^1";
 import ora from "npm:ora@^8.2.0";
 import chalk from "npm:chalk@^5.6.2";
-import { getPonsHome } from "jsr:@pons/sdk@^0.2";
-import type { ModuleManifest } from "jsr:@pons/sdk@^0.2";
+import { getPonsHome } from "@pons/sdk";
+import type { ModuleManifest } from "@pons/sdk";
 import { printError, printWarning } from "../formatters.ts";
 import { validatePermissions, computeManifestHash, PermissionStore } from '../security/permissions.ts';
 import * as prompts from 'npm:@clack/prompts@^0.10.1';

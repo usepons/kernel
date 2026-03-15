@@ -14,7 +14,7 @@
 import { join } from "jsr:@std/path@^1";
 import type { LogLevel } from "./config/types.ts";
 import Kernel from './kernel.ts';
-import { getPonsHome } from "jsr:@pons/sdk@0.2";
+import { getPonsHome } from "@pons/sdk";
 
 
 interface ParsedArgs {

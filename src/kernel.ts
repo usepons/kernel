@@ -1,5 +1,5 @@
 import { dirname, join, resolve } from "jsr:@std/path@^1";
-import { getPonsHome } from "jsr:@pons/sdk@^0.2";
+import { getPonsHome } from "@pons/sdk";
 import { ConfigManager } from "./config/manager.ts";
 import { createLogger } from "./logs/logger.ts";
 import type { KernelLogger } from "./logs/logger.ts";

@@ -7,9 +7,9 @@ import { join, toFileUrl } from "jsr:@std/path@^1";
 import { parse as parseYaml, stringify as stringifyYaml } from "npm:yaml@^2.7.1";
 import { z } from "npm:zod@^3.24";
 import type { ZodObject, ZodRawShape } from "npm:zod@^3.24";
-import { getPonsHome } from "jsr:@pons/sdk@^0.2";
-import type { ModuleManifest } from "jsr:@pons/sdk@^0.2";
-import type { ConfigSchemaDefinition } from "jsr:@pons/sdk@^0.2/config";
+import { getPonsHome } from "@pons/sdk";
+import type { ModuleManifest } from "@pons/sdk";
+import type { ConfigSchemaDefinition } from "@pons/sdk/config";
 import type {
   KernelConfig,
   DiagnosticReport,

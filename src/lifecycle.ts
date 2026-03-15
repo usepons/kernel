@@ -16,7 +16,7 @@ import { writeModuleLog, writeModuleLogGroup } from './logs/logger.ts';
 import type { MessageBus } from './messaging/bus.ts';
 import { ModuleRegistry } from './module/registry.ts';
 import type { ChildProcessLike } from './module/registry.ts';
-import type { KernelMessage, ModuleMessage, ModuleManifest } from 'jsr:@pons/sdk@^0.2';
+import type { KernelMessage, ModuleMessage, ModuleManifest } from '@pons/sdk';
 import type { SecurityEnforcer, ModuleCapabilities } from './security/enforcer.ts';
 import { translateToDenoFlags } from './security/permissions.ts';
 import type { PermissionStore } from './security/permissions.ts';
@@ -315,6 +315,12 @@ export class LifecycleManager {
     this.registry.setProcess(manifest.id, proc);
     this.spawnTimestamps.set(manifest.id, Date.now());
     this.logger.debug({ module: manifest.id, pid: proc.pid }, 'Module process spawned');
+
+    // First-time spawn: send install message before init so module can request permissions
+    if (this.permissionStore && !this.permissionStore.getFirstSpawnAt(manifest.id)) {
+      this.send(manifest.id, { type: 'install' });
+      this.permissionStore.setFirstSpawnAt(manifest.id);
+    }
 
     // Security: scope config to module's own section only (never send full config)
     const moduleConfigKey = manifest.configKey;

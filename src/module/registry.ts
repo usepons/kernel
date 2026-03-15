@@ -3,7 +3,7 @@
  * and the service directory (which module provides which service).
  */
 
-import type { ModuleManifest } from 'jsr:@pons/sdk@^0.2';
+import type { ModuleManifest } from '@pons/sdk';
 
 export type ModuleStatus = 'starting' | 'ready' | 'restarting' | 'stopped' | 'crashed';
 

@@ -5,5 +5,13 @@
   "cli": {
     "entrypoint": "src/cli.ts"
   },
-  "provides": ["module.loader", "bus", "lifecycle"]
+  "provides": ["module.loader", "bus", "lifecycle"],
+  "permissions": {
+    "net": [],
+    "read": ["~/.pons/"],
+    "write": ["~/.pons/"],
+    "env": ["HOME", "PONS_HOME"],
+    "run": [],
+    "sys": []
+  }
 }

@@ -7,7 +7,7 @@
  */
 
 import { join, resolve } from 'jsr:@std/path@^1';
-import type { ModuleManifest } from 'jsr:@pons/sdk@^0.2';
+import type { ModuleManifest } from '@pons/sdk';
 import { createLogger, type KernelLogger } from '../logs/logger.ts';
 import { modulePermissionsSchema, computeManifestHash } from '../security/permissions.ts';
 import type { PermissionStore } from '../security/permissions.ts';
@@ -32,7 +32,7 @@ export class ModuleLoader {
       return [];
     }
 
-    this.logger.info({ modulesDir: this.modulesDir }, 'Scanning modules directory');
+    this.logger.debug({ modulesDir: this.modulesDir }, 'Scanning modules directory');
     const discovered: DiscoveredModule[] = [];
 
     for (const entry of Deno.readDirSync(this.modulesDir)) {
@@ -118,7 +118,7 @@ export class ModuleLoader {
       discovered.push({ manifest, runnerPath, moduleDir });
     }
 
-    this.logger.info({ count: discovered.length }, 'Modules discovered');
+    this.logger.debug({ count: discovered.length }, 'Modules discovered');
     return discovered;
   }
 }
