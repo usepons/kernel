@@ -192,19 +192,35 @@ export default class Kernel {
       }
     });
 
-    // Permission hot-reload: CLI sends SIGUSR2 after revoking permissions
+    // Permission hot-reload: CLI sends SIGUSR2 after granting/revoking permissions
     Deno.addSignalListener("SIGUSR2", () => {
       this.logger.info("Received SIGUSR2 — reloading permissions");
       try {
+        // PONS-006: Snapshot effective permissions before reload
+        const before = new Map<string, string>();
+        for (const moduleId of this.lifecycle.getRegistry().ids()) {
+          const entry = this.lifecycle.getRegistry().get(moduleId);
+          if (!entry || entry.status === "stopped" || entry.status === "crashed") continue;
+          const eff = this.permissionStore.getEffectivePermissions(moduleId);
+          before.set(moduleId, JSON.stringify(eff));
+        }
+
         this.permissionStore.reload();
-        // Kill modules whose permissions were reduced or revoked
+
+        // Compare and act on changes
         for (const moduleId of this.lifecycle.getRegistry().ids()) {
           const entry = this.lifecycle.getRegistry().get(moduleId);
           if (!entry || entry.status === "stopped" || entry.status === "crashed") continue;
 
           if (!this.permissionStore.isApproved(moduleId)) {
-            this.logger.warn({ module: moduleId }, "Permissions revoked — killing module");
+            this.logger.warn({ module: moduleId }, "Permissions fully revoked — killing module");
             this.lifecycle.kill(moduleId, "permissions-revoked");
+          } else {
+            const after = JSON.stringify(this.permissionStore.getEffectivePermissions(moduleId));
+            if (before.get(moduleId) !== after) {
+              this.logger.info({ module: moduleId }, "Permissions changed — restarting with updated flags");
+              this.lifecycle.restartWithUpdatedPermissions(moduleId);
+            }
           }
         }
       } catch (err) {

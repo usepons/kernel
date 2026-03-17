@@ -439,7 +439,12 @@ export class LifecycleManager {
     }
 
     // Security: register module capabilities and validate topic subscriptions (fail-closed)
-    const capabilities = (manifest as ModuleManifest & { capabilities?: ModuleCapabilities }).capabilities ?? {};
+    // PONS-004: Load capabilities from the permission store (user-approved at install time),
+    // not from the module's self-asserted manifest. Fallback to manifest for backward compat.
+    const storedCaps = this.permissionStore?.getApprovedCapabilities(moduleId);
+    const capabilities = storedCaps
+      ?? (manifest as ModuleManifest & { capabilities?: ModuleCapabilities }).capabilities
+      ?? {};
     if (this.enforcer) {
       this.enforcer.setModuleCapabilities(moduleId, capabilities);
     }
@@ -830,7 +835,21 @@ export class LifecycleManager {
   // ─── Process Forking ─────────────────────────────────────────
 
   private forkProcess(runnerPath: string, manifest: ModuleManifest, env?: Record<string, string>): DenoChildProcessWrapper {
-    const childEnv = { ...Deno.env.toObject(), ...env };
+    // PONS-003: Build a minimal allowlisted environment instead of leaking the full parent env.
+    // Only pass system essentials + variables declared in the module's env permissions.
+    const SYSTEM_ENV_KEYS = ['PATH', 'HOME', 'TERM', 'LANG', 'SHELL', 'USER', 'TMPDIR', 'XDG_CACHE_HOME', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'DENO_DIR'];
+    const effectivePerms = this.permissionStore?.getEffectivePermissions(manifest.id);
+    const allowedEnvKeys = new Set([
+      ...SYSTEM_ENV_KEYS,
+      ...(effectivePerms?.env ?? []),
+    ]);
+    const childEnv: Record<string, string> = {};
+    for (const key of allowedEnvKeys) {
+      const val = Deno.env.get(key);
+      if (val !== undefined) childEnv[key] = val;
+    }
+    // Overlay any caller-provided env (used for module-specific settings like IPC ports)
+    if (env) Object.assign(childEnv, env);
 
     // Security: translate manifest permissions to Deno flags (never --allow-all)
     const moduleDir = dirname(runnerPath);

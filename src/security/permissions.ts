@@ -175,11 +175,19 @@ export function computeManifestHash(manifestPath: string): string {
 
 // ─── Extended Permission Types ──────────────────────────────────
 
+/** IPC capabilities stored at approval time. */
+export interface StoredCapabilities {
+  services?: string[];
+  topics?: string[];
+}
+
 export interface ModulePermissionEntry {
   base: ModulePermissions;
   baseManifestHash: string;
   baseGrantedAt: string;
   firstSpawnAt?: string;
+  // PONS-004: Capabilities stored in the permission store, not self-asserted by modules
+  capabilities?: StoredCapabilities;
   dynamic: ApprovedDynamicPermission[];
   pending: PendingRequest[];
   denied: DeniedRequest[];
@@ -311,6 +319,20 @@ export class PermissionStore {
       denied: [],
     };
     this.save();
+  }
+
+  /** PONS-004: Store IPC capabilities at approval time so they are kernel-controlled. */
+  approveCapabilities(moduleId: string, capabilities: StoredCapabilities): void {
+    if (!this.data[moduleId]) return;
+    this.data[moduleId].capabilities = capabilities;
+    this.save();
+  }
+
+  /** PONS-004: Retrieve kernel-stored capabilities (not self-asserted from manifest). */
+  getApprovedCapabilities(moduleId: string): StoredCapabilities | null {
+    const entry = this.data[moduleId];
+    if (!entry) return null;
+    return entry.capabilities ?? null;
   }
 
   revoke(moduleId: string, permissionType?: string, value?: string): boolean {

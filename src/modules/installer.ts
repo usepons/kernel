@@ -124,6 +124,8 @@ export async function displayAndApprovePermissions(
     console.log(chalk.dim('  Auto-approved (--yes flag)'));
     const hash = computeManifestHash(manifestPath);
     permissionStore.approve(manifest.id, permissions, hash);
+    // PONS-004: Store IPC capabilities in the permission store
+    permissionStore.approveCapabilities(manifest.id, manifest.capabilities ?? {});
 
     // Register service providers
     for (const svc of manifest.provides ?? []) {
@@ -142,6 +144,8 @@ export async function displayAndApprovePermissions(
 
   const hash = computeManifestHash(manifestPath);
   permissionStore.approve(manifest.id, permissions, hash);
+  // PONS-004: Store IPC capabilities in the permission store
+  permissionStore.approveCapabilities(manifest.id, manifest.capabilities ?? {});
 
   // Register service providers
   for (const svc of manifest.provides ?? []) {
@@ -211,6 +215,23 @@ async function downloadPackageFiles(
     }
 
     const content = await res.text();
+
+    // PONS-007: Verify checksum before writing to disk
+    const expected = versionMeta.manifest[filePath]?.checksum;
+    if (expected) {
+      const data = new TextEncoder().encode(content);
+      const hashBuffer = await crypto.subtle.digest("SHA-256", data);
+      const hashBytes = new Uint8Array(hashBuffer);
+      const hashB64 = btoa(String.fromCharCode(...hashBytes));
+      const actual = `sha256-${hashB64}`;
+      if (actual !== expected) {
+        throw new Error(
+          `Checksum mismatch for ${filePath}: expected ${expected}, got ${actual}. ` +
+          `The download may have been tampered with.`
+        );
+      }
+    }
+
     const localPath = join(targetDir, filePath);
     const dir = dirname(localPath);
 
