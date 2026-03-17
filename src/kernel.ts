@@ -11,8 +11,6 @@ import type { KernelConfig, LogLevel } from "./config/types.ts";
 import { PermissionStore } from "./security/permissions.ts";
 import type { ModulePermissions } from "./security/permissions.ts";
 import { SecurityEnforcer } from "./security/enforcer.ts";
-import { generateAndWriteToken } from "./api/auth.ts";
-import { handlePermissionRequest } from "./api/permissions.ts";
 
 function readVersion(): string {
   const baseDir = join(dirname(new URL(import.meta.url).pathname), "..");
@@ -45,8 +43,6 @@ export default class Kernel {
   private enforcer: SecurityEnforcer;
 
   private modules: DiscoveredModule[] = [];
-  private apiToken: string = '';
-  private httpServer?: Deno.HttpServer;
 
   constructor(
     private readonly logLevel?: string,
@@ -218,32 +214,12 @@ export default class Kernel {
 
     // Module hot-reload: CLI sends SIGHUP after installing/uninstalling modules
     Deno.addSignalListener("SIGHUP", () => {
-      this.logger.info("Received SIGHUP — re-discovering modules");
+      this.logger.info("Received SIGHUP — reloading permissions and re-discovering modules");
+      this.permissionStore.reload();
       this.reloadModules().catch((err) => {
         this.logger.error({ error: String(err) }, "Failed to reload modules");
       });
     });
-
-    // Generate bearer token for HTTP API
-    this.apiToken = generateAndWriteToken(getPonsHome());
-    this.logger.info("API token generated");
-
-    // Start HTTP API server
-    this.httpServer = Deno.serve(
-      { port: 0, hostname: '127.0.0.1', onListen: (addr) => {
-        const portPath = join(getPonsHome(), '.runtime', 'kernel.port');
-        Deno.writeTextFileSync(portPath, String(addr.port));
-        this.logger.info({ port: addr.port }, 'HTTP API listening');
-      }},
-      async (req: Request) => {
-        const permResponse = await handlePermissionRequest(req, this.permissionStore, this.lifecycle, this.apiToken);
-        if (permResponse) return permResponse;
-        return new Response(JSON.stringify({ error: 'Not found' }), {
-          status: 404,
-          headers: { 'Content-Type': 'application/json' },
-        });
-      },
-    );
 
     this.logger.info("Kernel running");
 
@@ -291,19 +267,12 @@ export default class Kernel {
     this.logger.info("─".repeat(60));
     this.logger.info("Kernel shutting down...");
 
-    // Stop HTTP API server
-    if (this.httpServer) {
-      try { this.httpServer.shutdown(); } catch { /* already stopped */ }
-    }
-
     await this.lifecycle.stopAll();
     await this.bus.close();
 
     // Remove runtime files
     const runtimeDir = join(getPonsHome(), ".runtime");
     try { Deno.removeSync(join(runtimeDir, "kernel.pid")); } catch { /* may not exist */ }
-    try { Deno.removeSync(join(runtimeDir, "kernel.port")); } catch { /* may not exist */ }
-    try { Deno.removeSync(join(runtimeDir, "kernel.token")); } catch { /* may not exist */ }
 
     Deno.exit(0);
   }

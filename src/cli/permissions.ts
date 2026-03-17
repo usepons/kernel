@@ -1,15 +1,21 @@
 /**
- * CLI commands for managing module permissions via the kernel HTTP API.
+ * CLI commands for managing module permissions via direct file access.
  *
- * Talks to the running kernel's permission endpoints on 127.0.0.1
- * rather than accessing the PermissionStore directly. This ensures
- * that permission changes are immediately reflected in the kernel
- * (e.g., module restarts after grant/revoke).
+ * Reads/writes the PermissionStore directly and sends SIGUSR2 to the
+ * running kernel to trigger permission reload.
  */
 
 import { join } from "jsr:@std/path@^1";
 import chalk from "npm:chalk@^5.6.2";
 import { getPonsHome } from "@pons/sdk";
+import {
+  PermissionStore,
+} from "../security/permissions.ts";
+import type {
+  ModulePermissions,
+  PendingRequest,
+  DeniedRequest,
+} from "../security/permissions.ts";
 import {
   createTable,
   outputJson,
@@ -21,68 +27,18 @@ import {
 type Command = { command(name: string): any; description(desc: string): any; action(fn: any): any; option(flags: string, desc: string): any; argument?(name: string, desc: string): any };
 
 /* ------------------------------------------------------------------ */
-/*  API helper                                                         */
+/*  Signal helper                                                      */
 /* ------------------------------------------------------------------ */
 
-async function apiCall(method: string, path: string, body?: unknown): Promise<unknown> {
-  const home = getPonsHome();
-  const port = Deno.readTextFileSync(join(home, '.runtime', 'kernel.port')).trim();
-  const token = Deno.readTextFileSync(join(home, '.runtime', 'kernel.token')).trim();
-
-  const res = await fetch(`http://127.0.0.1:${port}${path}`, {
-    method,
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${token}`,
-    },
-    body: body ? JSON.stringify(body) : undefined,
-  });
-
-  if (!res.ok) throw new Error(`API error: ${res.status} ${await res.text()}`);
-  return res.json();
-}
-
-/* ------------------------------------------------------------------ */
-/*  Type definitions for API responses                                 */
-/* ------------------------------------------------------------------ */
-
-interface ModulePermissions {
-  net?: string[];
-  read?: string[];
-  write?: string[];
-  env?: string[];
-  run?: string[];
-  sys?: string[];
-}
-
-interface PendingRequest {
-  id: string;
-  permissions: Partial<ModulePermissions>;
-  reason?: string;
-  requestedAt: string;
-}
-
-interface DeniedRequest {
-  permissions: Partial<ModulePermissions>;
-  reason?: string;
-  deniedAt: string;
-}
-
-interface ModulePermissionInfo {
-  effective: ModulePermissions | null;
-  base?: ModulePermissions;
-  pending: PendingRequest[];
-  denied?: DeniedRequest[];
-}
-
-interface ListAllResponse {
-  modules: Record<string, ModulePermissionInfo>;
-}
-
-interface ListModuleResponse {
-  moduleId: string;
-  effective: ModulePermissions | null;
-  pending: PendingRequest[];
+function sendKernelSignal(home: string, signal: Deno.Signal): boolean {
+  try {
+    const pidFile = join(home, '.runtime', 'kernel.pid');
+    const pid = parseInt(Deno.readTextFileSync(pidFile).trim());
+    Deno.kill(pid, signal);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -99,6 +55,13 @@ function formatPermissionValues(perms: Partial<ModulePermissions>): string {
     }
   }
   return parts.length > 0 ? parts.join('  ') : chalk.dim('\u2014');
+}
+
+interface ModulePermissionInfo {
+  effective: ModulePermissions | null;
+  base?: ModulePermissions;
+  pending: PendingRequest[];
+  denied?: DeniedRequest[];
 }
 
 function displayModulePermissions(moduleId: string, info: ModulePermissionInfo): void {
@@ -189,40 +152,61 @@ export function registerPermissionsCommand(program: Command): void {
     .command("list [module]")
     .description("List permissions for a module or all modules")
     .option("--json", "Output as JSON")
-    .action(async (moduleName: string | undefined, opts: { json?: boolean }) => {
+    .action((moduleName: string | undefined, opts: { json?: boolean }) => {
       const json = opts.json ?? false;
+      const home = getPonsHome();
 
       try {
+        const store = new PermissionStore(home);
+
         if (moduleName) {
-          const data = await apiCall('GET', `/api/permissions/list?moduleId=${encodeURIComponent(moduleName)}`) as ListModuleResponse;
+          const effective = store.getEffectivePermissions(moduleName);
+          const pendingMap = store.getPendingRequests(moduleName);
+          const pending = pendingMap[moduleName] ?? [];
 
           if (json) {
-            outputJson(data);
+            outputJson({ moduleId: moduleName, effective, pending });
             return;
           }
 
-          displayModulePermissions(data.moduleId, {
-            effective: data.effective,
-            pending: data.pending,
+          const approved = store.getApproved(moduleName);
+          displayModulePermissions(moduleName, {
+            effective,
+            base: approved?.permissions,
+            pending,
           });
         } else {
-          const data = await apiCall('GET', '/api/permissions/list') as ListAllResponse;
+          const all = store.listAll();
+          const allPending = store.getPendingRequests();
 
-          if (json) {
-            outputJson(data);
+          const moduleIds = Object.keys(all);
+          if (moduleIds.length === 0) {
+            if (json) {
+              outputJson({ modules: {} });
+            } else {
+              console.log(chalk.dim('  No module permissions configured.'));
+              console.log();
+            }
             return;
           }
 
-          const moduleIds = Object.keys(data.modules);
-          if (moduleIds.length === 0) {
-            console.log(chalk.dim('  No module permissions configured.'));
-            console.log();
+          const modules: Record<string, unknown> = {};
+          for (const id of moduleIds) {
+            modules[id] = {
+              effective: store.getEffectivePermissions(id),
+              base: all[id].permissions,
+              pending: allPending[id] ?? [],
+            };
+          }
+
+          if (json) {
+            outputJson({ modules });
             return;
           }
 
           printHeader(`Module Permissions (${moduleIds.length})`);
           const table = createTable(['Module', 'Net', 'Read', 'Write', 'Env', 'Run', 'Sys', 'Pending']);
-          for (const [id, info] of Object.entries(data.modules)) {
+          for (const [id, info] of Object.entries(modules) as [string, { effective: ModulePermissions | null; pending: PendingRequest[] }][]) {
             const eff = info.effective ?? {};
             table.push([
               id,
@@ -249,26 +233,20 @@ export function registerPermissionsCommand(program: Command): void {
     .command("pending")
     .description("Show modules with pending permission requests")
     .option("--json", "Output as JSON")
-    .action(async (opts: { json?: boolean }) => {
+    .action((opts: { json?: boolean }) => {
       const json = opts.json ?? false;
+      const home = getPonsHome();
 
       try {
-        const data = await apiCall('GET', '/api/permissions/list') as ListAllResponse;
-
-        // Filter to only modules with pending requests
-        const pending: Record<string, { pending: PendingRequest[] }> = {};
-        for (const [id, info] of Object.entries(data.modules)) {
-          if (info.pending && info.pending.length > 0) {
-            pending[id] = { pending: info.pending };
-          }
-        }
+        const store = new PermissionStore(home);
+        const allPending = store.getPendingRequests();
 
         if (json) {
-          outputJson({ modules: pending });
+          outputJson({ modules: allPending });
           return;
         }
 
-        const moduleIds = Object.keys(pending);
+        const moduleIds = Object.keys(allPending);
         if (moduleIds.length === 0) {
           console.log(chalk.dim('  No pending permission requests.'));
           console.log();
@@ -276,10 +254,10 @@ export function registerPermissionsCommand(program: Command): void {
         }
 
         printHeader(`Pending Permission Requests`);
-        for (const [id, info] of Object.entries(pending)) {
-          console.log(chalk.bold(`  ${id}`) + chalk.dim(` (${info.pending.length} pending)`));
+        for (const [id, pending] of Object.entries(allPending)) {
+          console.log(chalk.bold(`  ${id}`) + chalk.dim(` (${pending.length} pending)`));
           const table = createTable(['ID', 'Permissions', 'Reason', 'Requested']);
-          for (const req of info.pending) {
+          for (const req of pending) {
             table.push([
               req.id.slice(0, 8),
               formatPermissionValues(req.permissions),
@@ -301,28 +279,35 @@ export function registerPermissionsCommand(program: Command): void {
     .command("grant <module> [request-id]")
     .description("Grant pending permission request(s) for a module")
     .option("--json", "Output as JSON")
-    .action(async (moduleName: string, requestId: string | undefined, opts: { json?: boolean }) => {
+    .action((moduleName: string, requestId: string | undefined, opts: { json?: boolean }) => {
       const json = opts.json ?? false;
+      const home = getPonsHome();
 
       try {
+        const store = new PermissionStore(home);
+
         if (requestId) {
           // Grant a specific request
-          const result = await apiCall('POST', '/api/permissions/resolve', {
-            moduleId: moduleName,
-            requestId,
-            decision: 'grant',
-          });
+          const resolved = store.resolvePending(moduleName, requestId, 'grant');
+          if (!resolved) {
+            printError(`Pending request not found: ${requestId}`);
+            Deno.exitCode = 1;
+            return;
+          }
+
+          sendKernelSignal(home, 'SIGUSR2');
 
           if (json) {
-            outputJson(result);
+            outputJson({ ok: true, decision: 'grant' });
           } else {
             console.log(chalk.green(`  Granted request ${requestId.slice(0, 8)} for ${moduleName}.`));
           }
         } else {
           // Grant all pending requests for this module
-          const data = await apiCall('GET', `/api/permissions/list?moduleId=${encodeURIComponent(moduleName)}`) as ListModuleResponse;
+          const pendingMap = store.getPendingRequests(moduleName);
+          const pending = pendingMap[moduleName] ?? [];
 
-          if (!data.pending || data.pending.length === 0) {
+          if (pending.length === 0) {
             if (json) {
               outputJson({ module: moduleName, granted: 0 });
             } else {
@@ -332,19 +317,16 @@ export function registerPermissionsCommand(program: Command): void {
           }
 
           let granted = 0;
-          const results: unknown[] = [];
-          for (const req of data.pending) {
-            const result = await apiCall('POST', '/api/permissions/resolve', {
-              moduleId: moduleName,
-              requestId: req.id,
-              decision: 'grant',
-            });
-            results.push(result);
-            granted++;
+          for (const req of pending) {
+            if (store.resolvePending(moduleName, req.id, 'grant')) {
+              granted++;
+            }
           }
 
+          sendKernelSignal(home, 'SIGUSR2');
+
           if (json) {
-            outputJson({ module: moduleName, granted, results });
+            outputJson({ module: moduleName, granted });
           } else {
             console.log(chalk.green(`  Granted ${granted} pending request(s) for ${moduleName}.`));
           }
@@ -360,28 +342,35 @@ export function registerPermissionsCommand(program: Command): void {
     .command("deny <module> [request-id]")
     .description("Deny pending permission request(s) for a module")
     .option("--json", "Output as JSON")
-    .action(async (moduleName: string, requestId: string | undefined, opts: { json?: boolean }) => {
+    .action((moduleName: string, requestId: string | undefined, opts: { json?: boolean }) => {
       const json = opts.json ?? false;
+      const home = getPonsHome();
 
       try {
+        const store = new PermissionStore(home);
+
         if (requestId) {
           // Deny a specific request
-          const result = await apiCall('POST', '/api/permissions/resolve', {
-            moduleId: moduleName,
-            requestId,
-            decision: 'deny',
-          });
+          const resolved = store.resolvePending(moduleName, requestId, 'deny');
+          if (!resolved) {
+            printError(`Pending request not found: ${requestId}`);
+            Deno.exitCode = 1;
+            return;
+          }
+
+          sendKernelSignal(home, 'SIGUSR2');
 
           if (json) {
-            outputJson(result);
+            outputJson({ ok: true, decision: 'deny' });
           } else {
             console.log(chalk.yellow(`  Denied request ${requestId.slice(0, 8)} for ${moduleName}.`));
           }
         } else {
           // Deny all pending requests for this module
-          const data = await apiCall('GET', `/api/permissions/list?moduleId=${encodeURIComponent(moduleName)}`) as ListModuleResponse;
+          const pendingMap = store.getPendingRequests(moduleName);
+          const pending = pendingMap[moduleName] ?? [];
 
-          if (!data.pending || data.pending.length === 0) {
+          if (pending.length === 0) {
             if (json) {
               outputJson({ module: moduleName, denied: 0 });
             } else {
@@ -391,19 +380,16 @@ export function registerPermissionsCommand(program: Command): void {
           }
 
           let denied = 0;
-          const results: unknown[] = [];
-          for (const req of data.pending) {
-            const result = await apiCall('POST', '/api/permissions/resolve', {
-              moduleId: moduleName,
-              requestId: req.id,
-              decision: 'deny',
-            });
-            results.push(result);
-            denied++;
+          for (const req of pending) {
+            if (store.resolvePending(moduleName, req.id, 'deny')) {
+              denied++;
+            }
           }
 
+          sendKernelSignal(home, 'SIGUSR2');
+
           if (json) {
-            outputJson({ module: moduleName, denied, results });
+            outputJson({ module: moduleName, denied });
           } else {
             console.log(chalk.yellow(`  Denied ${denied} pending request(s) for ${moduleName}.`));
           }
@@ -421,23 +407,24 @@ export function registerPermissionsCommand(program: Command): void {
     .option("--type <type>", "Permission type to revoke (net, read, write, env, run, sys)")
     .option("--value <value>", "Specific permission value to revoke")
     .option("--json", "Output as JSON")
-    .action(async (moduleName: string, opts: { type?: string; value?: string; json?: boolean }) => {
+    .action((moduleName: string, opts: { type?: string; value?: string; json?: boolean }) => {
       const json = opts.json ?? false;
+      const home = getPonsHome();
 
       try {
-        const body: Record<string, unknown> = { moduleId: moduleName };
+        const store = new PermissionStore(home);
+        const revoked = store.revoke(moduleName, opts.type, opts.value);
 
-        if (opts.type) {
-          body.permissionType = opts.type;
-          if (opts.value) {
-            body.value = opts.value;
-          }
+        if (!revoked) {
+          printError(`Module "${moduleName}" not found in permission store.`);
+          Deno.exitCode = 1;
+          return;
         }
 
-        const result = await apiCall('POST', '/api/permissions/revoke', body);
+        sendKernelSignal(home, 'SIGUSR2');
 
         if (json) {
-          outputJson(result);
+          outputJson({ ok: true });
         } else {
           const desc = opts.type
             ? (opts.value ? `${opts.type}:${opts.value}` : opts.type)

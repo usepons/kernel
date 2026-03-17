@@ -26,7 +26,7 @@ import {
   updateModuleFromJsr,
 } from "./modules/installer.ts";
 import { initConfigCommands } from "./config/cli.ts";
-import { PermissionStore } from './security/permissions.ts';
+import { PermissionStore, computeManifestHash } from './security/permissions.ts';
 import { registerPermissionsCommand } from './cli/permissions.ts';
 
 // deno-lint-ignore no-explicit-any
@@ -383,21 +383,15 @@ export function init(program: Command): void {
 
       // Count pending permission requests
       try {
-        const port = Deno.readTextFileSync(join(home, '.runtime', 'kernel.port')).trim();
-        const token = Deno.readTextFileSync(join(home, '.runtime', 'kernel.token')).trim();
-        const res = await fetch(`http://127.0.0.1:${port}/api/permissions/list`, {
-          headers: { 'Authorization': `Bearer ${token}` },
-        });
-        if (res.ok) {
-          const data = await res.json();
-          const pendingCount = Object.values(data.modules ?? data).reduce(
-            (sum: number, m: any) => sum + (m.pending?.length || 0), 0
-          );
-          if (pendingCount > 0) {
-            console.log(chalk.yellow(`Pending permissions: ${pendingCount} request(s) (run 'pons permissions pending')`));
-          }
+        const store = new PermissionStore(home);
+        const allPending = store.getPendingRequests();
+        const pendingCount = Object.values(allPending).reduce(
+          (sum, requests) => sum + requests.length, 0
+        );
+        if (pendingCount > 0) {
+          console.log(chalk.yellow(`Pending permissions: ${pendingCount} request(s) (run 'pons permissions pending')`));
         }
-      } catch { /* kernel API not available */ }
+      } catch { /* permission store not available */ }
     });
 
   /* ---- kernel logs ---- */
@@ -652,8 +646,13 @@ export function init(program: Command): void {
       const store = new PermissionStore(home);
 
       if (store.isApproved(manifest.id)) {
-        console.log(chalk.dim(`Module "${manifest.id}" is already approved.`));
-        return;
+        const storedHash = store.getManifestHash(manifest.id);
+        const currentHash = computeManifestHash(manifestPath);
+        if (storedHash === currentHash) {
+          console.log(chalk.dim(`Module "${manifest.id}" is already approved and up to date.`));
+          return;
+        }
+        console.log(chalk.yellow(`  Module "${manifest.id}" manifest has changed since last approval — re-approval required.`));
       }
 
       const approved = await displayAndApprovePermissions(manifest, manifestPath, store, opts.yes);
