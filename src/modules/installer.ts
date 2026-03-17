@@ -221,8 +221,8 @@ async function downloadPackageFiles(
       const data = new TextEncoder().encode(content);
       const hashBuffer = await crypto.subtle.digest("SHA-256", data);
       const hashBytes = new Uint8Array(hashBuffer);
-      const hashB64 = btoa(String.fromCharCode(...hashBytes));
-      const actual = `sha256-${hashB64}`;
+      const hashHex = [...hashBytes].map(b => b.toString(16).padStart(2, '0')).join('');
+      const actual = `sha256-${hashHex}`;
       if (actual !== expected) {
         throw new Error(
           `Checksum mismatch for ${filePath}: expected ${expected}, got ${actual}. ` +
