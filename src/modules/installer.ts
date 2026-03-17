@@ -109,8 +109,7 @@ export async function displayAndApprovePermissions(
     ['Write', permissions.write ?? []],
     ['Env', permissions.env ?? []],
     ['Run', permissions.run ?? []],
-    ['Services', permissions.services ?? []],
-    ['Topics', permissions.topics ?? []],
+    ['Sys', permissions.sys ?? []],
   ];
 
   for (const [label, values] of entries) {

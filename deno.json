@@ -5,7 +5,8 @@
 
   "imports": {
     "@pons/sdk": "../sdk/src/index.ts",
-    "@pons/sdk/config": "../sdk/src/config.ts"
+    "@pons/sdk/config": "../sdk/src/config.ts",
+    "zod": "npm:zod@^3.24"
   },
 
   "exports": {
