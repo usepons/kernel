@@ -4,8 +4,8 @@
   "license": "MIT",
 
   "imports": {
-    "@pons/sdk": "../sdk/src/index.ts",
-    "@pons/sdk/config": "../sdk/src/config.ts",
+    "@pons/sdk": "jsr:@pons/sdk@^0.3",
+    "@pons/sdk/config": "jsr:@pons/sdk@^0.3/config",
     "zod": "npm:zod@^3.24"
   },
 
