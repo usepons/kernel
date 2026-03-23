@@ -10,7 +10,7 @@
     "net": [],
     "read": ["~/.pons/"],
     "write": ["~/.pons/"],
-    "env": ["HOME", "PONS_HOME"],
+    "env": ["DEBUG", "HOME", "PONS_HOME"],
     "run": [],
     "sys": []
   }
