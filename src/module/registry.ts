@@ -5,7 +5,7 @@
 
 import type { ModuleManifest } from '@pons/sdk';
 
-export type ModuleStatus = 'starting' | 'waiting' | 'ready' | 'restarting' | 'stopped' | 'crashed';
+export type ModuleStatus = 'starting' | 'waiting' | 'ready' | 'killed' | 'restarting' | 'stopped' | 'crashed';
 
 /** Minimal interface shared by DenoChildProcessWrapper and any test doubles. */
 export interface ChildProcessLike {

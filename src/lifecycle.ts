@@ -448,16 +448,16 @@ export class LifecycleManager {
 
   // ─── Kill / Hot-swap ──────────────────────────────────────────
 
-  async kill(moduleId: string, reason = 'requested'): Promise<void> {
-    await this.withModuleLock(moduleId, () => this.killInner(moduleId, reason));
+  async kill(moduleId: string, reason = 'requested', tier = 0): Promise<void> {
+    await this.withModuleLock(moduleId, () => this.killInner(moduleId, reason, tier));
   }
 
-  private async killInner(moduleId: string, reason: string): Promise<void> {
+  private async killInner(moduleId: string, reason: string, tier = 0): Promise<void> {
     const entry = this.registry.get(moduleId);
     if (!entry) return;
 
-    this.publishLifecycleEvent('system:module:stopping', { moduleId, reason });
-    this.registry.setStatus(moduleId, 'stopped');
+    this.publishLifecycleEvent('system:module:stopping', { moduleId, tier });
+    this.registry.setStatus(moduleId, 'killed');
     this.clearTimers(moduleId);
     this.clearPendingReady(moduleId);
 
@@ -476,6 +476,7 @@ export class LifecycleManager {
     this.cleanupModuleRpcs(moduleId);
     this.bus.unsubscribe(moduleId);
     this.enforcer?.removeModuleCapabilities(moduleId);
+    this.registry.setStatus(moduleId, 'stopped');
     this.publishLifecycleEvent('system:module:stopped', { moduleId, reason });
     this.logger.info({ moduleId, reason }, 'module.killed');
   }
@@ -547,6 +548,15 @@ export class LifecycleManager {
     for (const subscriberId of subscribers) {
       const entry = this.registry.get(subscriberId);
       if (!entry?.process?.connected || entry.status !== 'ready') continue;
+      // Spec §6: modules must declare system:module:* topics in capabilities.topics to receive them
+      if (this.enforcer) {
+        const caps = this.enforcer.getModuleCapabilities(subscriberId);
+        if (caps) {
+          const hasTopic = caps.topics.includes(topic) ||
+            caps.topics.some(t => t.endsWith(':*') && topic.startsWith(t.slice(0, -1)));
+          if (!hasTopic) continue;
+        }
+      }
       this.send(subscriberId, { type: 'deliver', id: crypto.randomUUID(), topic, payload });
     }
   }
@@ -822,7 +832,12 @@ export class LifecycleManager {
     this.registry.setStatus(moduleId, 'ready');
     this.startHealthCheck(moduleId);
     this.send(moduleId, { type: 'deps_ready' });
-    this.publishLifecycleEvent('system:module:ready', { moduleId });
+    const readyEntry = this.registry.get(moduleId);
+    this.publishLifecycleEvent('system:module:ready', {
+      moduleId,
+      provides: readyEntry?.manifest.provides ?? [],
+      version: readyEntry?.manifest.version ?? 'unknown',
+    });
     this.checkPendingReady();
     // Reset restart counter if module stays alive for 60+ seconds (spec §8)
     this.scheduleRestartCountReset(moduleId);
@@ -947,7 +962,7 @@ export class LifecycleManager {
     signal: string | null,
   ): void {
     const entry = this.registry.get(moduleId);
-    if (!entry || entry.status === 'stopped') return;
+    if (!entry || entry.status === 'stopped' || entry.status === 'killed') return;
 
     this.clearTimers(moduleId);
     this.cleanupModuleCalls(moduleId);
@@ -1198,9 +1213,9 @@ export class LifecycleManager {
   async stopAll(): Promise<void> {
     // Ordered shutdown: compute dependency tiers, kill leaves first (spec §7)
     const tiers = this.computeShutdownTiers();
-    for (const tier of tiers) {
+    for (let i = 0; i < tiers.length; i++) {
       // Parallel shutdown within each tier
-      await Promise.all(tier.map(id => this.kill(id, 'shutdown')));
+      await Promise.all(tiers[i].map(id => this.kill(id, 'shutdown', i)));
     }
   }
 

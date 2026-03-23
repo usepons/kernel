@@ -103,9 +103,6 @@ export default class Kernel {
     const configSource = join(getPonsHome(), "config.yaml");
     this.printStartupBanner(configSource, [configSource]);
 
-    // Structured boot event (spec §18)
-    this.logger.info({ version: this.version, moduleCount: this.modules.length, configPath: configSource }, 'kernel.boot');
-
     // Message bus
     this.logger.info("Message bus ready");
 
@@ -266,6 +263,9 @@ export default class Kernel {
     const runtimeDir = join(getPonsHome(), ".runtime");
     Deno.mkdirSync(runtimeDir, { recursive: true });
     Deno.writeTextFileSync(join(runtimeDir, "kernel.pid"), String(Deno.pid));
+
+    // Structured boot event — emitted after PID file write (spec §18, §2 Phase 4 step 16)
+    this.logger.info({ version: this.version, moduleCount: this.modules.length, configPath: join(getPonsHome(), "config.yaml") }, 'kernel.boot');
 
     return this;
   }

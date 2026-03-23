@@ -20,6 +20,7 @@ const NODE_BYPASS_PATTERNS: { pattern: RegExp; label: string; bypasses: string }
   { pattern: /from\s+['"]node:net['"]/, label: 'node:net', bypasses: '--allow-net' },
   { pattern: /from\s+['"]node:http['"]/, label: 'node:http', bypasses: '--allow-net' },
   { pattern: /from\s+['"]node:https['"]/, label: 'node:https', bypasses: '--allow-net' },
+  { pattern: /from\s+['"]node:tls['"]/, label: 'node:tls', bypasses: '--allow-net (TLS)' },
   // PONS-005: Additional dangerous node:* modules
   { pattern: /from\s+['"]node:process['"]/, label: 'node:process', bypasses: '--allow-env (process.env bypass)' },
   { pattern: /from\s+['"]node:dgram['"]/, label: 'node:dgram', bypasses: '--allow-net (UDP)' },

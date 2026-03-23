@@ -102,7 +102,7 @@ export class ModuleLoader {
         if (storedHash) {
           const currentHash = computeManifestHash(manifestPath);
           if (currentHash !== storedHash) {
-            this.logger.error({ module: manifest.id }, 'Module manifest has been modified since install — refusing to load (manifest-tampered)');
+            this.logger.error({ module: manifest.id }, `manifest hash mismatch for ${manifest.id} — re-install required`);
             continue;
           }
         }
