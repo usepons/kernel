@@ -9,7 +9,7 @@
  *   2. RPC — direct IPC routing (non-persistent, exactly-once, timeout on failure)
  */
 
-import { dirname, join, resolve } from 'jsr:@std/path@^1';
+import { dirname, join } from 'jsr:@std/path@^1';
 import type { DiscoveredModule } from './module/loader.ts';
 import type { KernelLogger } from './logs/logger.ts';
 import { writeModuleLog, writeModuleLogGroup } from './logs/logger.ts';
@@ -29,42 +29,72 @@ const VALID_MODULE_TYPES = new Set([
 ]);
 
 /** Validate incoming IPC data is a known ModuleMessage with required fields. */
-export function validateModuleMessage(raw: unknown): ModuleMessage | null {
-  if (raw == null || typeof raw !== 'object') return null;
-  const msg = raw as Record<string, unknown>;
-  if (typeof msg.type !== 'string' || !VALID_MODULE_TYPES.has(msg.type)) return null;
+export function validateModuleMessage(raw: unknown): { msg: ModuleMessage } | { msg: null; reason: string } {
+  if (raw == null || typeof raw !== 'object') return { msg: null, reason: 'not an object' };
+  const data = raw as Record<string, unknown>;
+  if (typeof data.type !== 'string' || !VALID_MODULE_TYPES.has(data.type)) return { msg: null, reason: `unknown type: ${String(data.type)?.slice(0, 50)}` };
 
   // Validate required fields per message type
-  switch (msg.type) {
+  const checkStr = (field: string): string | null => {
+    const v = data[field];
+    if (typeof v !== 'string') return `${field} is not a string`;
+    if (v.length > MAX_IPC_STRING_LEN) return `${field} exceeds ${MAX_IPC_STRING_LEN} chars (${v.length})`;
+    return null;
+  };
+
+  let err: string | null = null;
+  switch (data.type) {
     case 'rpc_request':
-      if (typeof msg.id !== 'string' || typeof msg.service !== 'string' || typeof msg.method !== 'string') return null;
+      err = checkStr('id') ?? checkStr('service') ?? checkStr('method');
       break;
     case 'rpc_response':
-      if (typeof msg.id !== 'string') return null;
+      err = checkStr('id');
       break;
     case 'publish':
-      if (typeof msg.topic !== 'string') return null;
+      err = checkStr('topic');
       break;
     case 'call':
-      if (typeof msg.id !== 'string' || typeof msg.method !== 'string') return null;
+      err = checkStr('id') ?? checkStr('method');
       break;
     case 'call:response':
-      if (typeof msg.id !== 'string') return null;
+      err = checkStr('id');
       break;
   }
 
-  return raw as ModuleMessage;
+  if (err) return { msg: null, reason: `${data.type}: ${err}` };
+  return { msg: raw as ModuleMessage };
 }
 
 // ─── Constants ─────────────────────────────────────────────────
 
-const MAX_RESTARTS = 5;
-const RESTART_BASE_MS = 1_000;
-const HEALTH_INTERVAL_MS = 30_000;
-const PING_TIMEOUT_MS = 10_000;
-const RPC_TIMEOUT_MS = 30_000;
-const REQUIRES_TIMEOUT_MS = 30_000;
-const SHUTDOWN_GRACE_MS = 5_000;
+// Default values — overridable via config.yaml `lifecycle` section (spec §15)
+const DEFAULTS = {
+  MAX_RESTARTS: 5,
+  RESTART_BASE_MS: 1_000,
+  HEALTH_INTERVAL_MS: 30_000,
+  PING_TIMEOUT_MS: 10_000,
+  RPC_TIMEOUT_MS: 30_000,
+  REQUIRES_TIMEOUT_MS: 30_000,
+  SHUTDOWN_GRACE_MS: 5_000,
+  HEALTH_MAX_FAILURES: 3,
+  READY_TIMEOUT_MS: 30_000,
+  MAX_RESTART_BACKOFF_MS: 60_000,
+} as const;
+const MAX_IPC_STRING_LEN = 256;
+const PROTOCOL_VERSION = '1.0';
+
+interface LifecycleLimits {
+  maxRestarts: number;
+  restartBaseMs: number;
+  healthIntervalMs: number;
+  pingTimeoutMs: number;
+  rpcTimeoutMs: number;
+  requiresTimeoutMs: number;
+  shutdownGraceMs: number;
+  healthMaxFailures: number;
+  readyTimeoutMs: number;
+  maxRestartBackoffMs: number;
+}
 
 // ─── Internal Types ────────────────────────────────────────────
 
@@ -110,6 +140,11 @@ class DenoChildProcessWrapper implements ChildProcessLike {
   private readonly _proc: Deno.ChildProcess;
   private readonly _stdin: WritableStreamDefaultWriter<Uint8Array>;
 
+  /** Serialized write queue — ensures ordering and backpressure on stdin writes. */
+  private _writeChain: Promise<void> = Promise.resolve();
+  private _writeQueueDepth = 0;
+  private static readonly MAX_WRITE_QUEUE = 512;
+
   constructor(proc: Deno.ChildProcess) {
     this._proc = proc;
     this.pid = proc.pid;
@@ -140,6 +175,10 @@ class DenoChildProcessWrapper implements ChildProcessLike {
       const code = status.success ? 0 : (status.code ?? 1);
       const signal = status.signal ?? null;
       for (const h of this.exitHandlers) h(code, signal);
+    }).catch(() => {
+      // OS-level error reading process status (e.g. waitpid failure)
+      this.connected = false;
+      for (const h of this.exitHandlers) h(null, null);
     });
   }
 
@@ -202,11 +241,24 @@ class DenoChildProcessWrapper implements ChildProcessLike {
 
   send(msg: unknown): void {
     if (!this.connected) return;
+    // Drop messages if queue is saturated — prevent unbounded memory growth
+    if (this._writeQueueDepth >= DenoChildProcessWrapper.MAX_WRITE_QUEUE) {
+      this.connected = false;
+      return;
+    }
     const line = JSON.stringify(msg) + '\n';
     const bytes = this.encoder.encode(line);
-    // Fire-and-forget write — errors mean the process is gone
-    this._stdin.write(bytes).catch(() => {
-      this.connected = false;
+    this._writeQueueDepth++;
+    // Queue writes to preserve ordering and apply backpressure.
+    // No retry — a partial write + retry would duplicate/garble IPC messages.
+    this._writeChain = this._writeChain.then(async () => {
+      this._writeQueueDepth--;
+      if (!this.connected) return;
+      try {
+        await this._stdin.write(bytes);
+      } catch {
+        this.connected = false;
+      }
     });
   }
 
@@ -241,8 +293,18 @@ export class LifecycleManager {
   private pendingReady = new Map<string, PendingReady>();
   private stderrBuffers = new Map<string, string>();
   private spawnTimestamps = new Map<string, number>();
+  /** Per-module lock to serialize kill/spawn and prevent restart races. */
+  private restartLocks = new Map<string, Promise<void>>();
+  /** Consecutive health-check failures per module. */
+  private healthFailures = new Map<string, number>();
+  /** Pending restart delay timers — cancellable on kill(). */
+  private restartTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  /** Ready timeout timers — kill module if it doesn't send 'ready' in time. */
+  private readyTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
   private readonly denoConfigPath: string | null;
+  /** Runtime-configurable limits (read from config.lifecycle, falls back to DEFAULTS). */
+  private limits: LifecycleLimits;
 
   constructor(
     private readonly logger: KernelLogger,
@@ -253,12 +315,49 @@ export class LifecycleManager {
     private readonly permissionStore?: PermissionStore,
   ) {
     this.denoConfigPath = this.findDenoConfig();
+    this.limits = this.loadLimits();
+  }
+
+  private loadLimits(): LifecycleLimits {
+    const cfg = (this.initPayload.config as Record<string, unknown>)?.lifecycle as Record<string, unknown> | undefined;
+    return {
+      maxRestarts: (cfg?.maxRestarts as number) ?? DEFAULTS.MAX_RESTARTS,
+      restartBaseMs: DEFAULTS.RESTART_BASE_MS,
+      healthIntervalMs: (cfg?.healthIntervalMs as number) ?? DEFAULTS.HEALTH_INTERVAL_MS,
+      pingTimeoutMs: (cfg?.pingTimeoutMs as number) ?? DEFAULTS.PING_TIMEOUT_MS,
+      rpcTimeoutMs: (cfg?.rpcTimeoutMs as number) ?? DEFAULTS.RPC_TIMEOUT_MS,
+      requiresTimeoutMs: (cfg?.requiresTimeoutMs as number) ?? DEFAULTS.REQUIRES_TIMEOUT_MS,
+      shutdownGraceMs: (cfg?.shutdownGraceMs as number) ?? DEFAULTS.SHUTDOWN_GRACE_MS,
+      healthMaxFailures: (cfg?.healthMaxFailures as number) ?? DEFAULTS.HEALTH_MAX_FAILURES,
+      readyTimeoutMs: (cfg?.readyTimeoutMs as number) ?? DEFAULTS.READY_TIMEOUT_MS,
+      maxRestartBackoffMs: (cfg?.maxRestartBackoffMs as number) ?? DEFAULTS.MAX_RESTART_BACKOFF_MS,
+    };
+  }
+
+  /** Acquire a per-module lock to serialize kill/spawn operations. */
+  private async withModuleLock(moduleId: string, fn: () => Promise<void>): Promise<void> {
+    // Chain on previous lock; absorb prior errors (don't re-invoke fn as rejection handler)
+    const prev = this.restartLocks.get(moduleId) ?? Promise.resolve();
+    const next = prev.catch(() => {}).then(fn);
+    this.restartLocks.set(moduleId, next);
+    try {
+      await next;
+    } finally {
+      // Clean up stale lock if this was the last operation
+      if (this.restartLocks.get(moduleId) === next) {
+        this.restartLocks.delete(moduleId);
+      }
+    }
   }
 
   // ─── Spawn ────────────────────────────────────────────────────
 
   async spawnAll(modules: DiscoveredModule[]): Promise<void> {
-      for (const { manifest, runnerPath } of modules) {
+    // Sort by manifest priority (lower = earlier, default 100)
+    const sorted = [...modules].sort(
+      (a, b) => (a.manifest.priority ?? 100) - (b.manifest.priority ?? 100),
+    );
+      for (const { manifest, runnerPath } of sorted) {
       try {
         await this.spawn(runnerPath, manifest);
         this.logger.debug({ module: manifest.id }, 'Module spawned');
@@ -277,7 +376,11 @@ export class LifecycleManager {
 
     // Only register fresh if not already in the registry (avoids resetting restartCount on respawn)
     if (!this.registry.get(manifest.id)) {
-      this.registry.register(manifest);
+      this.registry.register(manifest, runnerPath);
+    } else {
+      // Update runnerPath in case it changed (e.g. hot-swap)
+      const entry = this.registry.get(manifest.id)!;
+      entry.runnerPath = runnerPath;
     }
     if (!this.pendingCalls.has(manifest.id)) {
       this.pendingCalls.set(manifest.id, new Map());
@@ -286,7 +389,7 @@ export class LifecycleManager {
     const proc = this.forkProcess(runnerPath, manifest, env);
 
     proc.stdout?.on('data', (d: Uint8Array) => {
-      this.logger.debug({ module: manifest.id, source: 'stdout' }, new TextDecoder().decode(d).trim());
+      this.logger.warn({ module: manifest.id, source: 'stdout' }, new TextDecoder().decode(d).trim());
     });
     proc.stderr?.on('data', (d: Uint8Array) => {
       const text = new TextDecoder().decode(d).trim();
@@ -298,12 +401,16 @@ export class LifecycleManager {
     });
 
     proc.on('message', (raw) => {
-      const msg = validateModuleMessage(raw);
-      if (!msg) {
-        this.logger.warn({ module: manifest.id }, 'Invalid IPC message — ignoring');
+      // Discard messages from modules that are stopped or crashed (spec §14)
+      const currentEntry = this.registry.get(manifest.id);
+      if (!currentEntry || currentEntry.status === 'stopped' || currentEntry.status === 'crashed') return;
+
+      const validated = validateModuleMessage(raw);
+      if (!validated.msg) {
+        this.logger.warn({ module: manifest.id, reason: validated.reason }, 'Invalid IPC message — ignoring');
         return;
       }
-      this.handleMessage(manifest.id, msg).catch((err) => {
+      this.handleMessage(manifest.id, validated.msg).catch((err) => {
         this.logger.error({ module: manifest.id, error: String(err) }, 'Error handling module message');
       });
     });
@@ -314,7 +421,7 @@ export class LifecycleManager {
 
     this.registry.setProcess(manifest.id, proc);
     this.spawnTimestamps.set(manifest.id, Date.now());
-    this.logger.debug({ module: manifest.id, pid: proc.pid }, 'Module process spawned');
+    this.logger.info({ moduleId: manifest.id, pid: proc.pid, runtime: manifest.runtime ?? 'deno' }, 'module.spawn');
 
     // First-time spawn: send install message before init so module can request permissions
     if (this.permissionStore && !this.permissionStore.getFirstSpawnAt(manifest.id)) {
@@ -329,18 +436,27 @@ export class LifecycleManager {
       : {};
     this.send(manifest.id, {
       type: 'init',
+      protocolVersion: PROTOCOL_VERSION,
       config: scopedConfig,
       workspacePath: this.initPayload.workspacePath,
       projectRoot: this.initPayload.projectRoot,
     });
+
+    // Start ready timeout — if module doesn't send 'ready' within 30s, kill it
+    this.startReadyTimeout(manifest.id);
   }
 
   // ─── Kill / Hot-swap ──────────────────────────────────────────
 
   async kill(moduleId: string, reason = 'requested'): Promise<void> {
+    await this.withModuleLock(moduleId, () => this.killInner(moduleId, reason));
+  }
+
+  private async killInner(moduleId: string, reason: string): Promise<void> {
     const entry = this.registry.get(moduleId);
     if (!entry) return;
 
+    this.publishLifecycleEvent('system:module:stopping', { moduleId, reason });
     this.registry.setStatus(moduleId, 'stopped');
     this.clearTimers(moduleId);
     this.clearPendingReady(moduleId);
@@ -348,7 +464,7 @@ export class LifecycleManager {
     if (entry.process?.connected) {
       this.send(moduleId, { type: 'shutdown' });
       await new Promise<void>((resolve) => {
-        const timer = setTimeout(resolve, SHUTDOWN_GRACE_MS);
+        const timer = setTimeout(resolve, this.limits.shutdownGraceMs);
         entry.process?.once('exit', () => { clearTimeout(timer); resolve(); });
       });
       if (entry.process?.connected) {
@@ -359,7 +475,9 @@ export class LifecycleManager {
     this.cleanupModuleCalls(moduleId);
     this.cleanupModuleRpcs(moduleId);
     this.bus.unsubscribe(moduleId);
-    this.logger.info({ module: moduleId, reason }, 'Module stopped');
+    this.enforcer?.removeModuleCapabilities(moduleId);
+    this.publishLifecycleEvent('system:module:stopped', { moduleId, reason });
+    this.logger.info({ moduleId, reason }, 'module.killed');
   }
 
   async hotSwap(moduleId: string, newRunnerPath: string, newManifest: ModuleManifest, env?: Record<string, string>): Promise<void> {
@@ -392,20 +510,70 @@ export class LifecycleManager {
   }
 
   async restartWithUpdatedPermissions(moduleId: string): Promise<void> {
-    const entry = this.registry.get(moduleId);
-    if (!entry) return;
+    await this.withModuleLock(moduleId, async () => {
+      const entry = this.registry.get(moduleId);
+      if (!entry) return;
 
-    this.logger.info({ module: moduleId }, 'Restarting module with updated permissions');
+      this.logger.info({ module: moduleId }, 'Restarting module with updated permissions');
 
-    // Kill existing process
-    await this.kill(moduleId, 'permission-update');
+      const runnerPath = entry.runnerPath;
+      const { manifest } = entry;
 
-    // Re-spawn with updated flags (forkProcess reads from store)
-    const { manifest } = entry;
-    const modulesDir = resolve(this.initPayload.projectRoot, 'modules');
-    const entrypoint = manifest.entrypoint || 'runner.ts';
-    const runnerPath = resolve(modulesDir, manifest.id, entrypoint);
-    await this.spawn(runnerPath, manifest);
+      if (!runnerPath) {
+        this.logger.error({ module: moduleId }, 'Cannot restart — no runnerPath stored');
+        return;
+      }
+
+      // Kill and re-spawn atomically under the lock
+      await this.killInner(moduleId, 'permission-update');
+      await this.spawn(runnerPath, manifest);
+    });
+  }
+
+  /** Update the config reference used for new module spawns. */
+  updateConfig(config: unknown): void {
+    (this.initPayload as { config: unknown }).config = config;
+    this.limits = this.loadLimits();
+  }
+
+  /** Send a kernel message to a module (public wrapper for config:update, etc.). */
+  sendMessage(moduleId: string, msg: KernelMessage): boolean {
+    return this.send(moduleId, msg);
+  }
+
+  /** Publish a system lifecycle event on the message bus (spec §6). */
+  private publishLifecycleEvent(topic: string, payload: Record<string, unknown>): void {
+    const subscribers = this.bus.getSubscribers(topic);
+    for (const subscriberId of subscribers) {
+      const entry = this.registry.get(subscriberId);
+      if (!entry?.process?.connected || entry.status !== 'ready') continue;
+      this.send(subscriberId, { type: 'deliver', id: crypto.randomUUID(), topic, payload });
+    }
+  }
+
+  /**
+   * Refresh enforcer capabilities for all running modules from the permission store.
+   * Called after SIGUSR2 reloads permissions.yaml so capability changes take effect
+   * without requiring a full module restart.
+   */
+  refreshCapabilities(): void {
+    if (!this.enforcer) return;
+    for (const moduleId of this.registry.ids()) {
+      const entry = this.registry.get(moduleId);
+      if (!entry || entry.status === 'stopped' || entry.status === 'crashed') continue;
+      const manifest = entry.manifest;
+
+      const storedCaps = this.permissionStore?.getApprovedCapabilities(moduleId);
+      const manifestCaps = (manifest as ModuleManifest & { capabilities?: ModuleCapabilities }).capabilities;
+      const derivedCaps: ModuleCapabilities = {
+        topics: manifest.subscribes ?? [],
+        services: [...(manifest.requires ?? []), ...((manifest as ModuleManifest & { optionalRequires?: string[] }).optionalRequires ?? [])],
+      };
+      const hasStoredCaps = storedCaps && ((storedCaps.topics?.length ?? 0) > 0 || (storedCaps.services?.length ?? 0) > 0);
+      const capabilities = (hasStoredCaps ? storedCaps : null) ?? manifestCaps ?? derivedCaps;
+      this.enforcer.setModuleCapabilities(moduleId, capabilities);
+    }
+    this.logger.info('Enforcer capabilities refreshed for all running modules');
   }
 
   // ─── Message Routing ─────────────────────────────────────────
@@ -429,7 +597,10 @@ export class LifecycleManager {
   // ─── Message Handlers ────────────────────────────────────────
 
   private onReady(moduleId: string): void {
-    this.logger.info({ module: moduleId }, 'Module ready');
+    this.clearReadyTimeout(moduleId);
+    const spawnTime = this.spawnTimestamps.get(moduleId);
+    const startupMs = spawnTime ? Date.now() - spawnTime : undefined;
+    this.logger.info({ moduleId, ...(startupMs !== undefined ? { startupMs } : {}) }, 'module.ready');
 
     const storedEntry = this.registry.get(moduleId);
     const manifest = storedEntry?.manifest;
@@ -442,14 +613,21 @@ export class LifecycleManager {
     // PONS-004: Load capabilities from the permission store (user-approved at install time),
     // not from the module's self-asserted manifest. Fallback to manifest for backward compat.
     const storedCaps = this.permissionStore?.getApprovedCapabilities(moduleId);
-    const capabilities = storedCaps
-      ?? (manifest as ModuleManifest & { capabilities?: ModuleCapabilities }).capabilities
-      ?? {};
+    const manifestCaps = (manifest as ModuleManifest & { capabilities?: ModuleCapabilities }).capabilities;
+    // Backward compat: derive capabilities from manifest fields when no explicit capabilities block
+    const derivedCaps: ModuleCapabilities = {
+      topics: manifest.subscribes ?? [],
+      services: [...(manifest.requires ?? []), ...((manifest as ModuleManifest & { optionalRequires?: string[] }).optionalRequires ?? [])],
+    };
+    // Treat empty storedCaps (no topics/services) as unset so derivedCaps is used
+    const hasStoredCaps = storedCaps && ((storedCaps.topics?.length ?? 0) > 0 || (storedCaps.services?.length ?? 0) > 0);
+    const capabilities = (hasStoredCaps ? storedCaps : null) ?? manifestCaps ?? derivedCaps;
     if (this.enforcer) {
       this.enforcer.setModuleCapabilities(moduleId, capabilities);
     }
 
-    const topics = manifest.subscribes ?? [];
+    // Merge subscribes + capabilities.topics for subscription (spec §8 uses capabilities.topics)
+    const topics = [...new Set([...(manifest.subscribes ?? []), ...(manifest.capabilities?.topics ?? [])])];
     if (this.enforcer && topics.length > 0) {
       const caps = this.enforcer.getModuleCapabilities(moduleId);
       if (!caps) {
@@ -473,11 +651,12 @@ export class LifecycleManager {
     if (services.length > 0) {
       const rejected = this.registry.registerServices(moduleId, services);
       if (rejected.length > 0) {
-        this.logger.warn({ module: moduleId, rejected }, 'Service registration rejected — already provided by another module');
+        this.logger.error({ module: moduleId, rejected }, 'Duplicate service registration — killing module');
+        this.kill(moduleId, 'duplicate-service');
+        return;
       }
-      const registered = services.filter((s: string) => !rejected.includes(s));
-      if (registered.length > 0) {
-        this.logger.info({ module: moduleId, services: registered }, 'Services registered');
+      if (services.length > 0) {
+        this.logger.info({ module: moduleId, services }, 'Services registered');
       }
       this.notifyOptionalServices(services);
     }
@@ -486,10 +665,14 @@ export class LifecycleManager {
     const cycle = this.registry.detectCircularDeps(moduleId);
     if (cycle) {
       this.logger.error(
-        { module: moduleId, cycle: cycle.join(' → ') },
-        'Circular service dependency detected — killing module',
+        { moduleId, cycle: cycle.join(' → ') },
+        'Circular service dependency detected — killing all modules in cycle',
       );
-      this.kill(moduleId, 'circular-dependency');
+      // Kill ALL modules in the cycle, not just the triggering one (spec §14)
+      const uniqueModules = [...new Set(cycle)];
+      for (const cycleModuleId of uniqueModules) {
+        this.kill(cycleModuleId, 'circular-dependency');
+      }
       return;
     }
 
@@ -503,9 +686,10 @@ export class LifecycleManager {
         this.pendingReady.delete(moduleId);
         const stillMissing = requires.filter((s: string) => !this.registry.resolveService(s));
         this.logger.error({ module: moduleId, missing: stillMissing },
-          `Required services not satisfied within ${REQUIRES_TIMEOUT_MS / 1000}s — killing`);
+          `Required services not satisfied within ${this.limits.requiresTimeoutMs / 1000}s — killing`);
         this.kill(moduleId, 'requires-timeout');
-      }, REQUIRES_TIMEOUT_MS);
+      }, this.limits.requiresTimeoutMs);
+      this.registry.setStatus(moduleId, 'waiting');
       this.pendingReady.set(moduleId, { manifest, timer });
       this.logger.info({ module: moduleId, waiting: missing }, 'Waiting for required services');
     }
@@ -531,7 +715,7 @@ export class LifecycleManager {
     const subscribers = this.bus.getSubscribers(topic, fromModuleId);
     for (const subscriberId of subscribers) {
       const entry = this.registry.get(subscriberId);
-      if (!entry?.process?.connected) continue;
+      if (!entry?.process?.connected || entry.status !== 'ready') continue;
       this.send(subscriberId, {
         type: 'deliver',
         id: crypto.randomUUID(),
@@ -580,14 +764,14 @@ export class LifecycleManager {
       const capabilities = this.enforcer.getModuleCapabilities(callerModuleId);
       if (!capabilities) {
         this.enforcer.logViolation({ timestamp: new Date().toISOString(), moduleId: callerModuleId, type: 'rpc', resource: service, action: 'deny' });
-        this.send(callerModuleId, { type: 'rpc_response', id: rpcId, error: `Security violation: no approved capabilities` });
+        this.send(callerModuleId, { type: 'rpc_response', id: rpcId, error: 'forbidden' });
         this.kill(callerModuleId, 'security-violation');
         return;
       }
       const violation = this.enforcer.checkRpc(callerModuleId, service, capabilities);
       if (violation) {
         this.enforcer.logViolation(violation);
-        this.send(callerModuleId, { type: 'rpc_response', id: rpcId, error: `Security violation: not permitted to call service "${service}"` });
+        this.send(callerModuleId, { type: 'rpc_response', id: rpcId, error: 'forbidden' });
         this.kill(callerModuleId, 'security-violation');
         return;
       }
@@ -595,20 +779,21 @@ export class LifecycleManager {
 
     const targetModuleId = this.registry.resolveService(service);
     if (!targetModuleId) {
-      this.send(callerModuleId, { type: 'rpc_response', id: rpcId, error: `Service not found: ${service}` });
+      this.send(callerModuleId, { type: 'rpc_response', id: rpcId, error: 'service_not_found' });
       return;
     }
 
     const targetEntry = this.registry.get(targetModuleId);
-    if (!targetEntry?.process?.connected) {
-      this.send(callerModuleId, { type: 'rpc_response', id: rpcId, error: `Service ${service} unavailable (module ${targetModuleId} not connected)` });
+    if (!targetEntry?.process?.connected || targetEntry.status !== 'ready') {
+      this.send(callerModuleId, { type: 'rpc_response', id: rpcId, error: 'module_not_ready' });
       return;
     }
 
     const timer = setTimeout(() => {
       this.pendingRpc.delete(rpcId);
-      this.send(callerModuleId, { type: 'rpc_response', id: rpcId, error: `RPC ${service}.${method} timed out` });
-    }, RPC_TIMEOUT_MS);
+      this.logger.warn({ callerId: callerModuleId, targetService: service, method, timeoutMs: this.limits.rpcTimeoutMs }, 'rpc.timeout');
+      this.send(callerModuleId, { type: 'rpc_response', id: rpcId, error: 'timeout' });
+    }, this.limits.rpcTimeoutMs);
 
     this.pendingRpc.set(rpcId, { callerModuleId, targetModuleId, timer });
     this.send(targetModuleId, {
@@ -637,7 +822,26 @@ export class LifecycleManager {
     this.registry.setStatus(moduleId, 'ready');
     this.startHealthCheck(moduleId);
     this.send(moduleId, { type: 'deps_ready' });
+    this.publishLifecycleEvent('system:module:ready', { moduleId });
     this.checkPendingReady();
+    // Reset restart counter if module stays alive for 60+ seconds (spec §8)
+    this.scheduleRestartCountReset(moduleId);
+  }
+
+  private restartResetTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+  private scheduleRestartCountReset(moduleId: string): void {
+    const existing = this.restartResetTimers.get(moduleId);
+    if (existing) clearTimeout(existing);
+    const timer = setTimeout(() => {
+      this.restartResetTimers.delete(moduleId);
+      const entry = this.registry.get(moduleId);
+      if (entry && entry.status === 'ready' && entry.restartCount > 0) {
+        this.registry.resetRestartCount(moduleId);
+        this.logger.debug({ module: moduleId }, 'Restart counter reset — module stable for 60s');
+      }
+    }, 60_000);
+    this.restartResetTimers.set(moduleId, timer);
   }
 
   private notifyOptionalServices(newServices: string[]): void {
@@ -673,43 +877,61 @@ export class LifecycleManager {
 
   private startHealthCheck(moduleId: string): void {
     this.clearHealthTimer(moduleId);
+    this.healthFailures.set(moduleId, 0);
     const timer = setInterval(async () => {
       try {
         await this.ping(moduleId);
+        this.healthFailures.set(moduleId, 0);
       } catch {
-        this.logger.warn({ module: moduleId }, 'Health check failed — killing module');
-        const entry = this.registry.get(moduleId);
-        entry?.process?.kill('SIGKILL');
+        const failures = (this.healthFailures.get(moduleId) ?? 0) + 1;
+        this.healthFailures.set(moduleId, failures);
+        if (failures >= this.limits.healthMaxFailures) {
+          this.logger.warn({ module: moduleId, failures }, 'Health check failed — killing module');
+          // Route through kill() for proper cleanup (bus.unsubscribe, pending calls, etc.)
+          this.kill(moduleId, 'health-check-failed').catch(() => {});
+        } else {
+          this.logger.debug({ module: moduleId, failures, max: this.limits.healthMaxFailures }, 'Health check failed — retrying');
+        }
       }
-    }, HEALTH_INTERVAL_MS);
+    }, this.limits.healthIntervalMs);
 
     this.healthTimers.set(moduleId, timer);
   }
 
   private async ping(moduleId: string): Promise<void> {
     return new Promise((resolve, reject) => {
+      const calls = this.pendingCalls.get(moduleId);
+      if (!calls) {
+        reject(new Error(`Module ${moduleId} not available`));
+        return;
+      }
       const id = `ping:${crypto.randomUUID()}`;
       const timer = setTimeout(() => {
-        this.pendingCalls.get(moduleId)?.delete(id);
+        calls.delete(id);
         reject(new Error('Ping timeout'));
-      }, PING_TIMEOUT_MS);
+      }, this.limits.pingTimeoutMs);
 
-      this.pendingCalls.get(moduleId)?.set(id, { resolve: resolve as (v: unknown) => void, reject, timer });
+      calls.set(id, { resolve: resolve as (v: unknown) => void, reject, timer });
       this.send(moduleId, { type: 'ping' });
     });
   }
 
   // ─── Kernel → Module Call ────────────────────────────────────
 
-  call(moduleId: string, method: string, params?: unknown, timeoutMs = RPC_TIMEOUT_MS): Promise<unknown> {
+  call(moduleId: string, method: string, params?: unknown, timeoutMs = this.limits.rpcTimeoutMs): Promise<unknown> {
     return new Promise((resolve, reject) => {
+      const calls = this.pendingCalls.get(moduleId);
+      if (!calls) {
+        reject(new Error(`Module ${moduleId} not available`));
+        return;
+      }
       const id = crypto.randomUUID();
       const timer = setTimeout(() => {
-        this.pendingCalls.get(moduleId)?.delete(id);
+        calls.delete(id);
         reject(new Error(`Call ${method} timed out`));
       }, timeoutMs);
 
-      this.pendingCalls.get(moduleId)?.set(id, { resolve, reject, timer });
+      calls.set(id, { resolve, reject, timer });
       this.send(moduleId, { type: 'call', id, method, params });
     });
   }
@@ -747,25 +969,44 @@ export class LifecycleManager {
       detail = `exited after ${aliveMs}ms with no output — check the module entry point (runner) and its dependencies`;
     }
 
-    this.logger.warn(
-      { module: moduleId, code, signal, restarts, ...(aliveMs !== null ? { aliveMs } : {}), ...(lastStderr ? { lastStderr } : {}) },
-      detail ? `Module exited unexpectedly — ${detail}` : 'Module exited unexpectedly',
-    );
+    const crashFields = { moduleId, exitCode: code, signal, restartCount: restarts, ...(aliveMs !== null ? { aliveMs } : {}), ...(lastStderr ? { stderr: lastStderr } : {}) };
+    const crashMsg = detail ? `Module exited unexpectedly — ${detail}` : 'Module exited unexpectedly';
+    // Spec: instant exits (<1s) logged as warning; normal crashes as error
+    if (instant) {
+      this.logger.warn(crashFields, crashMsg);
+    } else {
+      this.logger.error(crashFields, crashMsg);
+    }
 
-    if (restarts > MAX_RESTARTS) {
+    if (restarts >= this.limits.maxRestarts) {
       this.registry.setStatus(moduleId, 'crashed');
-      this.logger.error({ module: moduleId }, 'Module crashed — max restarts reached');
+      // Full cleanup for permanently crashed modules
+      this.bus.unsubscribe(moduleId);
+      this.enforcer?.removeModuleCapabilities(moduleId);
+      this.restartLocks.delete(moduleId);
+      this.publishLifecycleEvent('system:module:crashed', { moduleId, restartCount: restarts });
+      this.logger.error({ moduleId }, 'Module crashed — max restarts reached');
       return;
     }
 
-    const delay = Math.min(RESTART_BASE_MS * Math.pow(2, restarts - 1), 60_000);
+    const delay = Math.min(this.limits.restartBaseMs * Math.pow(2, restarts - 1), this.limits.maxRestartBackoffMs);
     this.registry.setStatus(moduleId, 'restarting');
 
-    setTimeout(() => {
-      this.spawn(runnerPath, manifest, env).catch((err) => {
+    const restartTimer = setTimeout(() => {
+      this.restartTimers.delete(moduleId);
+      // Re-check status: module may have been intentionally killed during backoff
+      const current = this.registry.get(moduleId);
+      if (!current || current.status === 'stopped' || current.status === 'crashed') return;
+      this.withModuleLock(moduleId, async () => {
+        // Double-check inside lock — kill() may have run between timer fire and lock acquisition
+        const inner = this.registry.get(moduleId);
+        if (!inner || inner.status === 'stopped' || inner.status === 'crashed') return;
+        await this.spawn(runnerPath, manifest, env);
+      }).catch((err) => {
         this.logger.error({ module: moduleId, error: String(err) }, 'Module restart failed');
       });
     }, delay);
+    this.restartTimers.set(moduleId, restartTimer);
   }
 
   // ─── Cleanup ─────────────────────────────────────────────────
@@ -777,11 +1018,14 @@ export class LifecycleManager {
       clearTimeout(pending.timer);
       pending.reject(new Error(`Module ${moduleId} disconnected`));
     }
-    calls.clear();
+    // Remove the entire Map entry to avoid leaking empty Maps for crashed modules
+    this.pendingCalls.delete(moduleId);
   }
 
   private cleanupModuleRpcs(moduleId: string): void {
-    for (const [id, pending] of this.pendingRpc) {
+    // Snapshot entries before iterating — send() and delete() can mutate the Map
+    const entries = [...this.pendingRpc.entries()];
+    for (const [id, pending] of entries) {
       if (pending.targetModuleId === moduleId) {
         clearTimeout(pending.timer);
         this.pendingRpc.delete(id);
@@ -789,8 +1033,7 @@ export class LifecycleManager {
           type: 'rpc_response', id,
           error: `Module ${moduleId} stopped while processing RPC`,
         });
-      }
-      if (pending.callerModuleId === moduleId) {
+      } else if (pending.callerModuleId === moduleId) {
         clearTimeout(pending.timer);
         this.pendingRpc.delete(id);
       }
@@ -805,6 +1048,25 @@ export class LifecycleManager {
     }
   }
 
+  /** Start a timer that kills the module if it doesn't send 'ready' within READY_TIMEOUT_MS. */
+  private startReadyTimeout(moduleId: string): void {
+    this.clearReadyTimeout(moduleId);
+    const timer = setTimeout(() => {
+      this.readyTimers.delete(moduleId);
+      const entry = this.registry.get(moduleId);
+      if (!entry || entry.status !== 'starting') return;
+      this.logger.error({ module: moduleId }, `Module did not send 'ready' within ${this.limits.readyTimeoutMs / 1000}s — treating as crash`);
+      // Kill the process directly so onExit fires and triggers restart/backoff logic
+      entry.process?.kill('SIGKILL');
+    }, this.limits.readyTimeoutMs);
+    this.readyTimers.set(moduleId, timer);
+  }
+
+  private clearReadyTimeout(moduleId: string): void {
+    const t = this.readyTimers.get(moduleId);
+    if (t) { clearTimeout(t); this.readyTimers.delete(moduleId); }
+  }
+
   // ─── IPC Send ────────────────────────────────────────────────
 
   private send(moduleId: string, msg: KernelMessage): boolean {
@@ -815,6 +1077,7 @@ export class LifecycleManager {
         return true;
       } catch {
         // EPIPE — process disconnected between the connected check and send
+        this.logger.warn({ moduleId, msgType: (msg as { type: string }).type }, 'IPC write failed — module may be dead');
         return false;
       }
     }
@@ -825,6 +1088,12 @@ export class LifecycleManager {
 
   private clearTimers(moduleId: string): void {
     this.clearHealthTimer(moduleId);
+    this.clearReadyTimeout(moduleId);
+    this.healthFailures.delete(moduleId);
+    const restartTimer = this.restartTimers.get(moduleId);
+    if (restartTimer) { clearTimeout(restartTimer); this.restartTimers.delete(moduleId); }
+    const resetTimer = this.restartResetTimers.get(moduleId);
+    if (resetTimer) { clearTimeout(resetTimer); this.restartResetTimers.delete(moduleId); }
   }
 
   private clearHealthTimer(moduleId: string): void {
@@ -851,19 +1120,11 @@ export class LifecycleManager {
     // Overlay any caller-provided env (used for module-specific settings like IPC ports)
     if (env) Object.assign(childEnv, env);
 
-    // Security: translate manifest permissions to Deno flags (never --allow-all)
-    const moduleDir = dirname(runnerPath);
-    const effective = this.permissionStore?.getEffectivePermissions(manifest.id);
-    const denoPerms = effective
-      ? translateToDenoFlags(effective, moduleDir)
-      : ['--deny-all'];
-    // Prefer the module's own deno.json (needed for nodeModulesDir, import maps, etc.)
-    const moduleDenoConfig = join(dirname(runnerPath), 'deno.json');
-    const configPath = existsSync(moduleDenoConfig) ? moduleDenoConfig : this.denoConfigPath;
-    const denoArgs = configPath ? [`--config=${configPath}`] : [];
+    const runtime = manifest.runtime ?? 'deno';
+    const { executable, args: runtimeArgs } = this.buildRuntimeCommand(runtime, runnerPath, manifest);
 
-    const cmd = new Deno.Command(Deno.execPath(), {
-      args: ['run', ...denoPerms, '--unstable-sloppy-imports', ...denoArgs, runnerPath],
+    const cmd = new Deno.Command(executable, {
+      args: runtimeArgs,
       stdin: 'piped',
       stdout: 'piped',
       stderr: 'piped',
@@ -872,6 +1133,44 @@ export class LifecycleManager {
 
     const proc = cmd.spawn();
     return new DenoChildProcessWrapper(proc);
+  }
+
+  /** Build the spawn command based on the module's declared runtime (spec §21). */
+  private buildRuntimeCommand(runtime: string, runnerPath: string, manifest: ModuleManifest): { executable: string; args: string[] } {
+    const moduleDir = dirname(runnerPath);
+
+    switch (runtime) {
+      case 'deno': {
+        // Security: translate manifest permissions to Deno flags (never --allow-all)
+        const effective = this.permissionStore?.getEffectivePermissions(manifest.id);
+        const denoPerms = effective
+          ? translateToDenoFlags(effective, moduleDir)
+          : ['--deny-all'];
+        const moduleDenoConfig = join(moduleDir, 'deno.json');
+        const configPath = existsSync(moduleDenoConfig) ? moduleDenoConfig : this.denoConfigPath;
+        const denoArgs = configPath ? [`--config=${configPath}`] : [];
+        return {
+          executable: Deno.execPath(),
+          args: ['run', ...denoPerms, '--unstable-sloppy-imports', ...denoArgs, runnerPath],
+        };
+      }
+      case 'node':
+        return { executable: 'node', args: [runnerPath] };
+      case 'bun':
+        return { executable: 'bun', args: ['run', runnerPath] };
+      case 'python':
+        return { executable: 'python', args: [runnerPath] };
+      case 'php':
+        return { executable: 'php', args: [runnerPath] };
+      case 'go':
+      case 'rust':
+      case 'binary':
+        // Pre-compiled binary — execute directly
+        return { executable: runnerPath, args: [] };
+      default:
+        this.logger.warn({ module: manifest.id, runtime }, `Unknown runtime "${runtime}" — falling back to deno`);
+        return this.buildRuntimeCommand('deno', runnerPath, manifest);
+    }
   }
 
   private findDenoConfig(): string | null {
@@ -897,9 +1196,59 @@ export class LifecycleManager {
   }
 
   async stopAll(): Promise<void> {
-    const ids = this.registry.ids();
-    for (const id of ids) {
-      await this.kill(id, 'shutdown');
+    // Ordered shutdown: compute dependency tiers, kill leaves first (spec §7)
+    const tiers = this.computeShutdownTiers();
+    for (const tier of tiers) {
+      // Parallel shutdown within each tier
+      await Promise.all(tier.map(id => this.kill(id, 'shutdown')));
     }
+  }
+
+  /** Compute shutdown tiers via reverse topological sort (leaves first). */
+  private computeShutdownTiers(): string[][] {
+    const ids = this.registry.ids();
+    if (ids.length === 0) return [];
+
+    // Build dependsOn map: moduleId → set of modules it depends on (via requires → service providers)
+    const dependsOn = new Map<string, Set<string>>();
+    for (const id of ids) {
+      dependsOn.set(id, new Set());
+    }
+    for (const id of ids) {
+      const entry = this.registry.get(id);
+      const requires = entry?.manifest.requires ?? [];
+      for (const service of requires) {
+        const provider = this.registry.resolveService(service);
+        if (provider && provider !== id && dependsOn.has(provider)) {
+          dependsOn.get(id)!.add(provider);
+        }
+      }
+    }
+
+    // Kahn's algorithm — reverse topological order (modules with no dependents first = leaves)
+    const tiers: string[][] = [];
+    const remaining = new Set(ids);
+    while (remaining.size > 0) {
+      // Find modules that no remaining module depends on (leaves in the dependency graph)
+      const tier: string[] = [];
+      for (const id of remaining) {
+        let isDependency = false;
+        for (const otherId of remaining) {
+          if (otherId !== id && dependsOn.get(otherId)!.has(id)) {
+            isDependency = true;
+            break;
+          }
+        }
+        if (!isDependency) tier.push(id);
+      }
+      // Safety: if no leaves found (cycle), break and kill all remaining
+      if (tier.length === 0) {
+        tiers.push([...remaining]);
+        break;
+      }
+      tiers.push(tier);
+      for (const id of tier) remaining.delete(id);
+    }
+    return tiers;
   }
 }

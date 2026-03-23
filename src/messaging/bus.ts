@@ -23,8 +23,11 @@ export class MessageBus {
   }
 
   unsubscribe(moduleId: string): void {
-    for (const subscribers of this.subscriptions.values()) {
+    for (const [topic, subscribers] of this.subscriptions) {
       subscribers.delete(moduleId);
+      if (subscribers.size === 0) {
+        this.subscriptions.delete(topic);
+      }
     }
   }
 

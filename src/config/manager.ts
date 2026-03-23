@@ -23,6 +23,17 @@ const kernelBuiltinSchema = z.object({
     level: z.enum(["trace", "debug", "info", "warn", "error", "fatal"]).default("info"),
     levels: z.record(z.enum(["trace", "debug", "info", "warn", "error", "fatal"])).default({}),
   }).default({}),
+  lifecycle: z.object({
+    healthIntervalMs: z.number().int().min(1000).default(30_000),
+    pingTimeoutMs: z.number().int().min(1000).default(10_000),
+    healthMaxFailures: z.number().int().min(1).default(3),
+    readyTimeoutMs: z.number().int().min(1000).default(30_000),
+    requiresTimeoutMs: z.number().int().min(1000).default(30_000),
+    shutdownGraceMs: z.number().int().min(1000).default(5_000),
+    maxRestarts: z.number().int().min(0).default(5),
+    maxRestartBackoffMs: z.number().int().min(1000).default(60_000),
+    rpcTimeoutMs: z.number().int().min(1000).default(30_000),
+  }).default({}),
 });
 
 const UNSAFE_KEYS = new Set(["__proto__", "constructor", "prototype"]);
@@ -77,44 +88,61 @@ export class ConfigManager {
           console.warn(`[config] Schema path escapes module directory for "${manifest.id}" — skipping`);
           continue;
         }
-        // Security: validate schema file extension — only allow .ts/.js schema files
-        if (!realPath.endsWith('.ts') && !realPath.endsWith('.js')) {
-          console.warn(`[config] Schema file must be .ts or .js for "${manifest.id}" — skipping`);
-          continue;
-        }
-        // Security: static analysis — reject schema files containing dangerous APIs
-        const schemaSource = Deno.readTextFileSync(realPath);
-        const FORBIDDEN_PATTERNS = [
-          /\bDeno\s*\.\s*(run|Command|exec|remove|writeFile|writeTextFile|mkdir|rename|chmod|chown|kill|exit)\b/,
-          /\bDeno\s*\.\s*(listen|connect|listenTls|connectTls|serve)\b/,
-          /\bchild_process\b/,
-          /\bimport\s*\(/,       // dynamic imports
-          /\brequire\s*\(/,
-          /\beval\s*\(/,
-          /\bnew\s+Function\s*\(/,
-          /\bfetch\s*\(/,
-          /\bWebSocket\b/,
-        ];
-        const hasForbidden = FORBIDDEN_PATTERNS.find(p => p.test(schemaSource));
-        if (hasForbidden) {
-          console.warn(`[config] Schema file for "${manifest.id}" contains forbidden API pattern — skipping (matched: ${hasForbidden})`);
+        // Security: validate schema file extension — allow .ts, .js, or .json
+        const isJson = realPath.endsWith('.json');
+        const isTsJs = realPath.endsWith('.ts') || realPath.endsWith('.js');
+        if (!isJson && !isTsJs) {
+          console.warn(`[config] Schema file must be .ts, .js, or .json for "${manifest.id}" — skipping`);
           continue;
         }
 
-        const mod = await import(toFileUrl(realPath).href);
-        const definition: ConfigSchemaDefinition = mod.default;
+        if (isJson) {
+          // JSON Schema — parse and convert to Zod passthrough (no code execution)
+          const jsonContent = Deno.readTextFileSync(realPath);
+          const jsonSchema = JSON.parse(jsonContent);
+          // Use a permissive Zod object with passthrough for JSON Schema defined configs
+          const looseSchema = z.object({}).passthrough().default({});
+          this.schemas.set(manifest.configKey, {
+            configKey: manifest.configKey,
+            schema: z.object({ [manifest.configKey]: looseSchema }) as unknown as ZodObject<ZodRawShape>,
+            meta: { description: jsonSchema.description ?? `Config for ${manifest.id}` },
+            moduleId: manifest.id,
+          });
+        } else {
+          // TypeScript/JS schema — static analysis + dynamic import
+          const schemaSource = Deno.readTextFileSync(realPath);
+          const FORBIDDEN_PATTERNS = [
+            /\bDeno\s*\.\s*(run|Command|exec|remove|writeFile|writeTextFile|mkdir|rename|chmod|chown|kill|exit)\b/,
+            /\bDeno\s*\.\s*(listen|connect|listenTls|connectTls|serve)\b/,
+            /\bchild_process\b/,
+            /\bimport\s*\(/,       // dynamic imports
+            /\brequire\s*\(/,
+            /\beval\s*\(/,
+            /\bnew\s+Function\s*\(/,
+            /\bfetch\s*\(/,
+            /\bWebSocket\b/,
+          ];
+          const hasForbidden = FORBIDDEN_PATTERNS.find(p => p.test(schemaSource));
+          if (hasForbidden) {
+            console.warn(`[config] Schema file for "${manifest.id}" contains forbidden API pattern — skipping (matched: ${hasForbidden})`);
+            continue;
+          }
 
-        if (!definition?.schema) continue;
+          const mod = await import(toFileUrl(realPath).href);
+          const definition: ConfigSchemaDefinition = mod.default;
 
-        this.schemas.set(manifest.configKey, {
-          configKey: manifest.configKey,
-          schema: z.object({ [manifest.configKey]: definition.schema }) as unknown as ZodObject<ZodRawShape>,
-          meta: definition.meta ? {
-            description: definition.meta.description,
-            labels: definition.meta.labels as Record<string, string> | undefined,
-          } : undefined,
-          moduleId: manifest.id,
-        });
+          if (!definition?.schema) continue;
+
+          this.schemas.set(manifest.configKey, {
+            configKey: manifest.configKey,
+            schema: z.object({ [manifest.configKey]: definition.schema }) as unknown as ZodObject<ZodRawShape>,
+            meta: definition.meta ? {
+              description: definition.meta.description,
+              labels: definition.meta.labels as Record<string, string> | undefined,
+            } : undefined,
+            moduleId: manifest.id,
+          });
+        }
       } catch (err) {
         // Log warning but don't fail — module will run with raw config
         console.warn(`[config] Failed to load schema for module "${manifest.id}": ${err instanceof Error ? err.message : String(err)}`);
@@ -162,21 +190,36 @@ export class ConfigManager {
    */
   load(): KernelConfig {
     try { Deno.statSync(this.configPath); } catch {
+      console.warn(`[config] Config file not found at ${this.configPath} — using schema defaults`);
       if (this.appSchema) {
         this.configData = this.appSchema.parse({}) as Record<string, unknown>;
       }
       return this.configData as KernelConfig;
     }
 
-    const raw = Deno.readTextFileSync(this.configPath);
-    const parsed: Record<string, unknown> = parseYaml(raw) || {};
+    let raw: string;
+    try {
+      raw = Deno.readTextFileSync(this.configPath);
+    } catch (err) {
+      console.error(`[config] Failed to read config file: ${err instanceof Error ? err.message : String(err)} — keeping previous config`);
+      return this.configData as KernelConfig;
+    }
+
+    let parsed: Record<string, unknown>;
+    try {
+      parsed = parseYaml(raw) || {};
+    } catch (err) {
+      // Invalid YAML: reject load, keep previous config, log error (spec §14)
+      console.error(`[config] Invalid YAML in ${this.configPath}: ${err instanceof Error ? err.message : String(err)} — keeping previous config`);
+      return this.configData as KernelConfig;
+    }
 
     if (this.appSchema) {
       const result = this.appSchema.safeParse(parsed);
       if (result.success) {
         this.configData = result.data as Record<string, unknown>;
       } else {
-        // Best-effort: use raw parsed data, warn about validation errors
+        // Best-effort: use raw parsed data, warn about validation errors per field
         this.configData = parsed;
         const errorPaths = result.error.issues.map(i => `${i.path.join(".")}: ${i.message}`).join("; ");
         console.warn(`[config] Validation warnings: ${errorPaths}`);

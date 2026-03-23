@@ -27,7 +27,7 @@ function parseArgs(): ParsedArgs {
   
 
   for (let i = 0; i < args.length; i++) {
-    if (args[i] === '-log-level' || args[i] === '--log') logLevel = args[i + 1] as LogLevel;
+    if (args[i] === '-log-level' || args[i] === '--log' || args[i] === '--log-level') logLevel = args[i + 1] as LogLevel;
   }
 
   return { logLevel };

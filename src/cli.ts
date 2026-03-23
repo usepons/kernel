@@ -26,7 +26,7 @@ import {
   updateModuleFromJsr,
 } from "./modules/installer.ts";
 import { initConfigCommands } from "./config/cli.ts";
-import { PermissionStore, computeManifestHash } from './security/permissions.ts';
+import { PermissionStore, computeManifestHash, modulePermissionsSchema } from './security/permissions.ts';
 import { registerPermissionsCommand } from './cli/permissions.ts';
 
 // deno-lint-ignore no-explicit-any
@@ -268,6 +268,38 @@ async function startForeground(logLevel?: string): Promise<never> {
   // Block forever so the CLI's parseAsync never resolves and Deno.exit is not called.
   // The kernel's shutdown() sets Deno.exitCode and the process exits when the event loop drains.
   return new Promise(() => {});
+}
+
+/* ------------------------------------------------------------------ */
+/*  Post-update re-approval                                           */
+/* ------------------------------------------------------------------ */
+
+/**
+ * After a module update, check if the manifest hash changed and re-approve.
+ * Shows the updated permissions to the user for consent.
+ */
+async function reapproveAfterUpdate(moduleId: string, moduleDir: string, home: string): Promise<void> {
+  const manifestPath = join(moduleDir, "module.json");
+  if (!existsSync(manifestPath)) return;
+
+  let manifest: ModuleManifest;
+  try {
+    manifest = JSON.parse(Deno.readTextFileSync(manifestPath)) as ModuleManifest;
+  } catch {
+    return;
+  }
+
+  const store = new PermissionStore(home);
+  const storedHash = store.getManifestHash(manifest.id ?? moduleId);
+  const currentHash = computeManifestHash(manifestPath);
+
+  if (storedHash === currentHash) return; // No manifest change
+
+  console.log(chalk.yellow(`\n  Module manifest changed — re-approval required.`));
+  const approved = await displayAndApprovePermissions(manifest, manifestPath, store);
+  if (!approved) {
+    console.log(chalk.yellow('  Permissions not approved — module may fail to load.'));
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -513,12 +545,18 @@ export function init(program: Command): void {
         return;
       }
 
+      const store = new PermissionStore(home);
+
       const moduleList: Array<{
         id: string;
         version: string;
         provides: string[];
         requires: string[];
         linked: boolean;
+        approved: boolean;
+        manifestOk: boolean;
+        permsValid: boolean;
+        hasCaps: boolean;
       }> = [];
 
       for (const entry of Deno.readDirSync(modulesDir)) {
@@ -546,12 +584,40 @@ export function init(program: Command): void {
             }
           }
 
+          // Check approval status
+          const approved = store.isApproved(manifest.id);
+
+          // Check manifest hash
+          let manifestOk = false;
+          if (approved) {
+            const storedHash = store.getManifestHash(manifest.id);
+            const currentHash = computeManifestHash(manifestPath);
+            manifestOk = storedHash === currentHash;
+          }
+
+          // Validate permissions block
+          let permsValid = false;
+          if (manifest.permissions) {
+            try {
+              modulePermissionsSchema.parse(manifest.permissions);
+              permsValid = true;
+            } catch { /* invalid */ }
+          }
+
+          // Check if capabilities are stored
+          const caps = store.getApprovedCapabilities(manifest.id);
+          const hasCaps = !!caps && ((caps.topics?.length ?? 0) > 0 || (caps.services?.length ?? 0) > 0);
+
           moduleList.push({
             id: manifest.id,
             version: version ?? "0.0.0",
             provides: manifest.provides ?? [],
             requires: manifest.requires ?? [],
             linked,
+            approved,
+            manifestOk,
+            permsValid,
+            hasCaps,
           });
         } catch {
           // Skip malformed manifests
@@ -567,13 +633,19 @@ export function init(program: Command): void {
 
       printHeader(`Installed Modules (${moduleList.length})`);
 
-      const table = createTable(["Module", "Version", "Provides", "Type"]);
+      const ok = chalk.green("\u2713");
+      const fail = chalk.red("\u2717");
+      const table = createTable(["Module", "Version", "Provides", "Type", "Approved", "Manifest", "Perms", "Caps"]);
       for (const mod of moduleList) {
         table.push([
           mod.id,
           mod.version,
           mod.provides.join(", ") || chalk.dim("\u2014"),
           mod.linked ? chalk.yellow("linked") : "installed",
+          mod.approved ? ok : fail,
+          mod.approved ? (mod.manifestOk ? ok : chalk.red("tampered")) : chalk.dim("\u2014"),
+          mod.permsValid ? ok : fail,
+          mod.hasCaps ? ok : chalk.yellow("empty"),
         ]);
       }
       console.log(table.toString());
@@ -854,6 +926,9 @@ export function init(program: Command): void {
 
         if (source === "jsr") {
           const result = await updateModuleFromJsr(id, moduleDir);
+          if (result.updated) {
+            await reapproveAfterUpdate(id, moduleDir, home);
+          }
           results.push({ id, ...result });
           continue;
         }
@@ -874,6 +949,7 @@ export function init(program: Command): void {
           }
 
           spinner.succeed(`Updated ${chalk.green(id)}`);
+          await reapproveAfterUpdate(id, moduleDir, home);
           results.push({ id, updated: true });
         } catch (error) {
           spinner.fail(`Failed to update "${id}"`);

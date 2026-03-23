@@ -124,7 +124,12 @@ export async function displayAndApprovePermissions(
     const hash = computeManifestHash(manifestPath);
     permissionStore.approve(manifest.id, permissions, hash);
     // PONS-004: Store IPC capabilities in the permission store
-    permissionStore.approveCapabilities(manifest.id, manifest.capabilities ?? {});
+    // Derive from subscribes/requires when no explicit capabilities block exists
+    const caps1 = manifest.capabilities ?? {
+      topics: manifest.subscribes ?? [],
+      services: [...(manifest.requires ?? []), ...((manifest as any).optionalRequires ?? [])],
+    };
+    permissionStore.approveCapabilities(manifest.id, caps1);
 
     // Register service providers
     for (const svc of manifest.provides ?? []) {
@@ -144,7 +149,12 @@ export async function displayAndApprovePermissions(
   const hash = computeManifestHash(manifestPath);
   permissionStore.approve(manifest.id, permissions, hash);
   // PONS-004: Store IPC capabilities in the permission store
-  permissionStore.approveCapabilities(manifest.id, manifest.capabilities ?? {});
+  // Derive from subscribes/requires when no explicit capabilities block exists
+  const caps2 = manifest.capabilities ?? {
+    topics: manifest.subscribes ?? [],
+    services: [...(manifest.requires ?? []), ...((manifest as any).optionalRequires ?? [])],
+  };
+  permissionStore.approveCapabilities(manifest.id, caps2);
 
   // Register service providers
   for (const svc of manifest.provides ?? []) {

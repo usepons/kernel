@@ -1,7 +1,7 @@
 import { dirname, join, resolve } from "jsr:@std/path@^1";
 import { getPonsHome } from "@pons/sdk";
 import { ConfigManager } from "./config/manager.ts";
-import { createLogger } from "./logs/logger.ts";
+import { createLogger, closeLogger } from "./logs/logger.ts";
 import type { KernelLogger } from "./logs/logger.ts";
 import { MessageBus } from "./messaging/bus.ts";
 import { LifecycleManager } from "./lifecycle.ts";
@@ -43,6 +43,11 @@ export default class Kernel {
   private enforcer: SecurityEnforcer;
 
   private modules: DiscoveredModule[] = [];
+  /** Guards against concurrent/duplicate shutdown calls. */
+  private _shuttingDown = false;
+  private _bootTime = Date.now();
+  /** Stored signal handler references for cleanup on shutdown. */
+  private _signalHandlers: Array<{ signal: Deno.Signal; handler: () => void }> = [];
 
   constructor(
     private readonly logLevel?: string,
@@ -62,15 +67,8 @@ export default class Kernel {
     this.permissionStore = new PermissionStore();
     this.enforcer = new SecurityEnforcer(this.permissionStore, this.logger);
     this.moduleLoader = new ModuleLoader(this.modulesDir, this.permissionStore);
-    this.lifecycle = new LifecycleManager(
-      this.logger,
-      this.bus,
-      { config: this.configManager.getAll(), workspacePath: getPonsHome(), projectRoot: getPonsHome() },
-      (moduleId, method, params) =>
-        this.handleModuleCall(moduleId, method, params),
-      this.enforcer,
-      this.permissionStore,
-    );
+    // LifecycleManager is created in boot() after config is loaded — not here.
+    this.lifecycle = null!;
   }
 
   /**
@@ -101,13 +99,17 @@ export default class Kernel {
     }
 
     this._config = config;
+    this._bootTime = Date.now();
     const configSource = join(getPonsHome(), "config.yaml");
     this.printStartupBanner(configSource, [configSource]);
+
+    // Structured boot event (spec §18)
+    this.logger.info({ version: this.version, moduleCount: this.modules.length, configPath: configSource }, 'kernel.boot');
 
     // Message bus
     this.logger.info("Message bus ready");
 
-    // Lifecycle manager
+    // Lifecycle manager — single creation point (never in constructor)
     this.lifecycle = new LifecycleManager(
       this.logger,
       this.bus,
@@ -124,18 +126,31 @@ export default class Kernel {
   /**
    * Start phase — spawn discovered modules, register shutdown handlers.
    */
+  private addSignalHandler(signal: Deno.Signal, handler: () => void): void {
+    Deno.addSignalListener(signal, handler);
+    this._signalHandlers.push({ signal, handler });
+  }
+
+  private removeAllSignalHandlers(): void {
+    for (const { signal, handler } of this._signalHandlers) {
+      try { Deno.removeSignalListener(signal, handler); } catch { /* already removed */ }
+    }
+    this._signalHandlers = [];
+  }
+
   async start(): Promise<this> {
     this.lifecycle.spawnAll(this.modules);
 
-    Deno.addSignalListener("SIGINT", () => {
+    this.addSignalHandler("SIGINT", () => {
       this.shutdown().catch(console.error);
     });
-    Deno.addSignalListener("SIGTERM", () => {
+    this.addSignalHandler("SIGTERM", () => {
       this.shutdown().catch(console.error);
     });
 
     // Config hot-reload: CLI sends SIGUSR1 after writing config
-    Deno.addSignalListener("SIGUSR1", () => {
+    this.addSignalHandler("SIGUSR1", () => {
+      if (this._shuttingDown) return;
       this.logger.info("Received SIGUSR1 — reloading config");
       try {
         const oldConfig = structuredClone(this.configManager.getAll());
@@ -161,11 +176,15 @@ export default class Kernel {
           return;
         }
 
-        this.logger.info({ changedSections }, "Config sections changed");
+        // Compute affected modules for the config.reload event
+        const affectedModules = this.lifecycle.getRegistry().ids().filter((id) => {
+          const e = this.lifecycle.getRegistry().get(id);
+          return e?.status === 'ready' && e.manifest.configKey && changedSections.includes(e.manifest.configKey);
+        });
+        this.logger.info({ changedSections, affectedModules }, "config.reload");
 
         // Update lifecycle init payload config reference
-        (this.lifecycle as unknown as { initPayload: { config: unknown } })
-          .initPayload.config = this._config;
+        this.lifecycle.updateConfig(this._config);
 
         // Notify affected modules
         for (const moduleId of this.lifecycle.getRegistry().ids()) {
@@ -176,7 +195,7 @@ export default class Kernel {
           const moduleConfigKey = manifest.configKey;
           if (moduleConfigKey && changedSections.includes(moduleConfigKey)) {
             // Security: send only the module's own config section and relevant changed sections
-            this.lifecycle["send"](moduleId, {
+            this.lifecycle.sendMessage(moduleId, {
               type: "config:update" as const,
               config: { [moduleConfigKey]: this.configManager.getSection(moduleConfigKey) },
               changedSections: changedSections.filter((s: string) => s === moduleConfigKey),
@@ -193,7 +212,8 @@ export default class Kernel {
     });
 
     // Permission hot-reload: CLI sends SIGUSR2 after granting/revoking permissions
-    Deno.addSignalListener("SIGUSR2", () => {
+    this.addSignalHandler("SIGUSR2", () => {
+      if (this._shuttingDown) return;
       this.logger.info("Received SIGUSR2 — reloading permissions");
       try {
         // PONS-006: Snapshot effective permissions before reload
@@ -206,6 +226,8 @@ export default class Kernel {
         }
 
         this.permissionStore.reload();
+        // Refresh enforcer capabilities so updated caps take effect immediately
+        this.lifecycle.refreshCapabilities();
 
         // Compare and act on changes
         for (const moduleId of this.lifecycle.getRegistry().ids()) {
@@ -229,7 +251,8 @@ export default class Kernel {
     });
 
     // Module hot-reload: CLI sends SIGHUP after installing/uninstalling modules
-    Deno.addSignalListener("SIGHUP", () => {
+    this.addSignalHandler("SIGHUP", () => {
+      if (this._shuttingDown) return;
       this.logger.info("Received SIGHUP — reloading permissions and re-discovering modules");
       this.permissionStore.reload();
       this.reloadModules().catch((err) => {
@@ -253,14 +276,18 @@ export default class Kernel {
    */
   private async reloadModules(): Promise<void> {
     const freshModules = await this.moduleLoader.discover();
+    const freshIds = new Set(freshModules.map((m) => m.manifest.id));
     const runningIds = new Set(this.lifecycle.getRegistry().ids());
 
-    const newModules = freshModules.filter((m) => !runningIds.has(m.manifest.id));
-
-    if (newModules.length === 0) {
-      this.logger.info("No new modules found");
-      return;
+    // Kill modules whose directories have been removed
+    for (const id of runningIds) {
+      if (!freshIds.has(id)) {
+        this.logger.info({ module: id }, "Module no longer on disk — stopping");
+        await this.lifecycle.kill(id, "uninstalled");
+      }
     }
+
+    const newModules = freshModules.filter((m) => !runningIds.has(m.manifest.id));
 
     // Re-discover config schemas for new modules
     await this.configManager.discoverSchemas(
@@ -269,19 +296,28 @@ export default class Kernel {
     this._config = this.configManager.load();
 
     // Update lifecycle config reference
-    (this.lifecycle as unknown as { initPayload: { config: unknown } })
-      .initPayload.config = this._config;
+    this.lifecycle.updateConfig(this._config);
 
-    this.logger.info({ modules: newModules.map((m) => m.manifest.id) }, "Spawning new modules");
-    await this.lifecycle.spawnAll(newModules);
+    if (newModules.length > 0) {
+      this.logger.info({ modules: newModules.map((m) => m.manifest.id) }, "Spawning new modules");
+      await this.lifecycle.spawnAll(newModules);
+    } else {
+      this.logger.info("No new modules found");
+    }
 
     // Update internal module list
     this.modules = freshModules;
   }
 
   async shutdown(): Promise<void> {
+    if (this._shuttingDown) return;
+    this._shuttingDown = true;
+
+    this.removeAllSignalHandlers();
+
+    const uptime = Date.now() - this._bootTime;
     this.logger.info("─".repeat(60));
-    this.logger.info("Kernel shutting down...");
+    this.logger.info({ reason: 'signal', uptime }, 'kernel.shutdown');
 
     await this.lifecycle.stopAll();
     await this.bus.close();
@@ -289,6 +325,9 @@ export default class Kernel {
     // Remove runtime files
     const runtimeDir = join(getPonsHome(), ".runtime");
     try { Deno.removeSync(join(runtimeDir, "kernel.pid")); } catch { /* may not exist */ }
+
+    // Flush and close log file handle before exit
+    closeLogger();
 
     Deno.exit(0);
   }
@@ -333,7 +372,7 @@ export default class Kernel {
             if (entry?.process?.connected) {
               // Security: send only the affected module's own config section
               const modConfigKey = entry.manifest?.configKey;
-              this.lifecycle["send"](modId, {
+              this.lifecycle.sendMessage(modId, {
                 type: "config:update" as const,
                 config: modConfigKey ? { [modConfigKey]: this.configManager.getSection(modConfigKey) } : {},
                 changedSections: [section],
@@ -381,6 +420,11 @@ export default class Kernel {
           return { granted: false, pending: true, requestId: existing.id };
         }
 
+        // Guard: module may have been removed from permissions store during SIGUSR2 race
+        if (!this.permissionStore.isApproved(moduleId)) {
+          return { granted: false, denied: true };
+        }
+
         // Queue as pending
         const pending = this.permissionStore.addPendingRequest(moduleId, permissions, reason);
 
@@ -421,16 +465,19 @@ export default class Kernel {
 
   private sendSystemNotification(moduleId: string): void {
     try {
+      // Sanitize moduleId — strip anything that could escape shell/AppleScript strings
+      const safeId = moduleId.replace(/[^a-zA-Z0-9_\-\.]/g, '');
+      // Fire-and-forget — never block the event loop for a best-effort notification
       if (Deno.build.os === 'darwin') {
         new Deno.Command('osascript', {
-          args: ['-e', `display notification "Module ${moduleId} is waiting for permission approval" with title "Pons"`],
+          args: ['-e', `display notification "Module ${safeId} is waiting for permission approval" with title "Pons"`],
           stdout: 'null', stderr: 'null',
-        }).outputSync();
+        }).spawn();
       } else {
         new Deno.Command('notify-send', {
-          args: ['Pons', `Module ${moduleId} is waiting for permission approval`],
+          args: ['Pons', `Module ${safeId} is waiting for permission approval`],
           stdout: 'null', stderr: 'null',
-        }).outputSync();
+        }).spawn();
       }
     } catch { /* notification is best-effort */ }
   }

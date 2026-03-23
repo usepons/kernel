@@ -46,7 +46,10 @@ export class ModuleLoader {
       }
 
       const manifestPath = join(moduleDir, 'module.json');
-      try { Deno.statSync(manifestPath); } catch { continue; }
+      try { Deno.statSync(manifestPath); } catch {
+        this.logger.debug({ path: moduleDir }, 'No module.json found — skipping directory');
+        continue;
+      }
 
       let manifest: ModuleManifest;
       try {
@@ -60,6 +63,24 @@ export class ModuleLoader {
           !manifest.name || typeof manifest.name !== 'string') {
         this.logger.warn({ path: manifestPath }, 'Invalid manifest — missing id or name — skipping');
         continue;
+      }
+
+      // Protocol version compatibility check (spec §17)
+      const KERNEL_PROTOCOL_MAJOR = 1;
+      const KERNEL_PROTOCOL_MINOR = 0;
+      const minProto = manifest.minProtocolVersion || '1.0';
+      const [reqMajorStr, reqMinorStr] = minProto.split('.');
+      const reqMajor = parseInt(reqMajorStr, 10) || 0;
+      const reqMinor = parseInt(reqMinorStr, 10) || 0;
+      if (reqMajor !== KERNEL_PROTOCOL_MAJOR || reqMinor > KERNEL_PROTOCOL_MINOR) {
+        this.logger.error({ module: manifest.id, required: minProto, kernel: `${KERNEL_PROTOCOL_MAJOR}.${KERNEL_PROTOCOL_MINOR}` },
+          'Incompatible protocol version — skipping');
+        continue;
+      }
+
+      // Normalize entry/entrypoint (spec uses "entry", codebase uses "entrypoint")
+      if (manifest.entry && !manifest.entrypoint) {
+        manifest.entrypoint = manifest.entry;
       }
 
       // Security: validate permissions block
@@ -99,8 +120,18 @@ export class ModuleLoader {
 
       const entrypoint = manifest.entrypoint || 'runner.ts';
       // Security: verify entrypoint resolves within the module directory (prevent path traversal)
-      const resolvedEntry = resolve(moduleDir, entrypoint);
-      if (!resolvedEntry.startsWith(moduleDir + '/') && resolvedEntry !== moduleDir) {
+      // Use realPathSync to normalize symlinks and case on case-insensitive filesystems
+      let resolvedEntry: string;
+      let realModuleDir: string;
+      try {
+        realModuleDir = Deno.realPathSync(moduleDir);
+        resolvedEntry = Deno.realPathSync(resolve(moduleDir, entrypoint));
+      } catch {
+        // If realPath fails, fall back to resolve (file may not exist yet for .js check)
+        realModuleDir = moduleDir;
+        resolvedEntry = resolve(moduleDir, entrypoint);
+      }
+      if (!resolvedEntry.startsWith(realModuleDir + '/') && resolvedEntry !== realModuleDir) {
         this.logger.error({ module: manifest.id, entrypoint }, 'Entry point escapes module directory — skipping');
         continue;
       }

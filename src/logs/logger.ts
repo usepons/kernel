@@ -26,22 +26,39 @@ function todayStamp(): string {
   return `${yyyy}-${mm}-${dd}`;
 }
 
-function createDailyFileOutput(logDir: string): (data: string) => void {
+interface DailyFileOutput {
+  write: (data: string) => void;
+  close: () => void;
+}
+
+function createDailyFileOutput(logDir: string): DailyFileOutput {
   Deno.mkdirSync(logDir, { recursive: true });
 
   let currentDate = todayStamp();
   let fileHandle = Deno.openSync(join(logDir, `kernel-${currentDate}.log`), { write: true, create: true, append: true });
   const encoder = new TextEncoder();
 
-  return (data: string) => {
-    const now = todayStamp();
-    if (now !== currentDate) {
-      fileHandle.close();
-      currentDate = now;
-      fileHandle = Deno.openSync(join(logDir, `kernel-${currentDate}.log`), { write: true, create: true, append: true });
-    }
-    fileHandle.writeSync(encoder.encode(data));
+  return {
+    write(data: string) {
+      const now = todayStamp();
+      if (now !== currentDate) {
+        fileHandle.close();
+        currentDate = now;
+        fileHandle = Deno.openSync(join(logDir, `kernel-${currentDate}.log`), { write: true, create: true, append: true });
+      }
+      fileHandle.writeSync(encoder.encode(data));
+    },
+    close() {
+      try { fileHandle.close(); } catch { /* already closed */ }
+    },
   };
+}
+
+/** Close the log file handle if the logger was created with a logDir. */
+let _activeFileOutput: DailyFileOutput | null = null;
+export function closeLogger(): void {
+  _activeFileOutput?.close();
+  _activeFileOutput = null;
 }
 
 export function createLogger(config?: CreateLoggerOptions): KernelLogger {
@@ -57,8 +74,11 @@ export function createLogger(config?: CreateLoggerOptions): KernelLogger {
     return pino({ level }, stdoutStream);
   }
 
-  const fileOutput = createDailyFileOutput(config.logDir);
-  const fileStream = createLogStream({ colorize: false, output: fileOutput });
+  // Close any previous file output to avoid fd leaks on multiple createLogger() calls
+  _activeFileOutput?.close();
+  const dailyFile = createDailyFileOutput(config.logDir);
+  _activeFileOutput = dailyFile;
+  const fileStream = createLogStream({ colorize: false, output: dailyFile.write });
 
   const multi = pino.multistream([
     { stream: stdoutStream, level: level as pino.Level },

@@ -140,10 +140,12 @@ export function translateToDenoFlags(permissions: ModulePermissions, moduleDir?:
     const available = permissions.run.filter(binaryExists);
     const dangerous = available.filter(b => DANGEROUS_BINARIES.has(b));
     if (dangerous.length > 0) {
-      console.warn(`[security] Module requests shell interpreters: ${dangerous.join(', ')} — these can bypass Deno sandbox restrictions`);
+      console.warn(`[security] Blocking shell interpreters: ${dangerous.join(', ')} — these can bypass Deno sandbox restrictions`);
     }
-    if (available.length > 0) {
-      flags.push(`--allow-run=${available.join(',')}`);
+    // Exclude dangerous binaries that can trivially escape the sandbox
+    const safe = available.filter(b => !DANGEROUS_BINARIES.has(b));
+    if (safe.length > 0) {
+      flags.push(`--allow-run=${safe.join(',')}`);
     } else {
       flags.push('--deny-run');
     }

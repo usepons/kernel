@@ -92,7 +92,8 @@ export class SecurityEnforcer {
       action: 'deny',
     });
 
-    if (!keyPath || keyPath === '.' || keyPath === '..' || keyPath.includes('..')) {
+    const UNSAFE_SEGMENTS = new Set(['..', '__proto__', 'constructor', 'prototype']);
+    if (!keyPath || keyPath === '.' || keyPath === '..' || keyPath.split('.').some(s => UNSAFE_SEGMENTS.has(s))) {
       return deny();
     }
 
@@ -112,13 +113,11 @@ export class SecurityEnforcer {
   logViolation(violation: SecurityViolation): void {
     this.logger.error(
       {
-        timestamp: violation.timestamp,
         moduleId: violation.moduleId,
-        violationType: violation.type,
-        resource: violation.resource,
         action: violation.action,
+        target: violation.resource,
       },
-      'Security violation',
+      'security.violation',
     );
   }
 
@@ -137,5 +136,12 @@ export class SecurityEnforcer {
    */
   setModuleCapabilities(moduleId: string, capabilities: ModuleCapabilities): void {
     this.moduleCapabilities.set(moduleId, capabilities);
+  }
+
+  /**
+   * Remove capabilities for a module (on kill or crash).
+   */
+  removeModuleCapabilities(moduleId: string): void {
+    this.moduleCapabilities.delete(moduleId);
   }
 }

@@ -5,7 +5,7 @@
 
 import type { ModuleManifest } from '@pons/sdk';
 
-export type ModuleStatus = 'starting' | 'ready' | 'restarting' | 'stopped' | 'crashed';
+export type ModuleStatus = 'starting' | 'waiting' | 'ready' | 'restarting' | 'stopped' | 'crashed';
 
 /** Minimal interface shared by DenoChildProcessWrapper and any test doubles. */
 export interface ChildProcessLike {
@@ -20,6 +20,7 @@ export interface ChildProcessLike {
 
 export interface ModuleEntry {
   manifest: ModuleManifest;
+  runnerPath: string | null;
   process: ChildProcessLike | null;
   status: ModuleStatus;
   pid: number | undefined;
@@ -36,9 +37,10 @@ export class ModuleRegistry {
 
   // ─── Module Registration ────────────────────────────────────
 
-  register(manifest: ModuleManifest): void {
+  register(manifest: ModuleManifest, runnerPath?: string): void {
     this.modules.set(manifest.id, {
       manifest,
+      runnerPath: runnerPath ?? null,
       process: null,
       status: 'starting',
       pid: undefined,
@@ -129,9 +131,11 @@ export class ModuleRegistry {
 
   /** Remove all services provided by a module */
   removeServices(moduleId: string): void {
-    for (const [service, provider] of this.serviceProviders) {
-      if (provider === moduleId) this.serviceProviders.delete(service);
-    }
+    // Snapshot keys before iterating to avoid mutation during iteration
+    const toDelete = [...this.serviceProviders.entries()]
+      .filter(([, provider]) => provider === moduleId)
+      .map(([service]) => service);
+    for (const service of toDelete) this.serviceProviders.delete(service);
   }
 
   /** Resolve which module provides a service */
@@ -178,6 +182,8 @@ export class ModuleRegistry {
         if (cycle) return cycle;
       }
 
+      // Backtrack: allow re-visiting from different paths (proper DFS)
+      visited.delete(currentId);
       path.pop();
       return null;
     };
