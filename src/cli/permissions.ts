@@ -16,6 +16,7 @@ import type {
   PendingRequest,
   DeniedRequest,
 } from "../security/permissions.ts";
+import { PERMISSION_FIELDS } from "../security/constants.ts";
 import {
   createTable,
   outputJson,
@@ -47,7 +48,7 @@ function sendKernelSignal(home: string, signal: Deno.Signal): boolean {
 
 function formatPermissionValues(perms: Partial<ModulePermissions>): string {
   const parts: string[] = [];
-  const fields: (keyof ModulePermissions)[] = ['net', 'read', 'write', 'env', 'run', 'sys'];
+  const fields = PERMISSION_FIELDS;
   for (const field of fields) {
     const values = perms[field];
     if (values && values.length > 0) {
@@ -69,7 +70,7 @@ function displayModulePermissions(moduleId: string, info: ModulePermissionInfo):
 
   // Base permissions
   if (info.base) {
-    const fields: (keyof ModulePermissions)[] = ['net', 'read', 'write', 'env', 'run', 'sys'];
+    const fields = PERMISSION_FIELDS;
     const hasBase = fields.some(f => info.base![f] && info.base![f]!.length > 0);
     if (hasBase) {
       console.log(chalk.bold('  Base permissions:'));
@@ -88,7 +89,7 @@ function displayModulePermissions(moduleId: string, info: ModulePermissionInfo):
 
   // Effective permissions (base + dynamic merged)
   if (info.effective) {
-    const fields: (keyof ModulePermissions)[] = ['net', 'read', 'write', 'env', 'run', 'sys'];
+    const fields = PERMISSION_FIELDS;
     const hasEffective = fields.some(f => info.effective![f] && info.effective![f]!.length > 0);
     if (hasEffective) {
       console.log();

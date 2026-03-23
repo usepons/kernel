@@ -9,8 +9,14 @@ import { ModuleLoader } from "./module/loader.ts";
 import type { DiscoveredModule } from "./module/loader.ts";
 import type { KernelConfig, LogLevel } from "./config/types.ts";
 import { PermissionStore } from "./security/permissions.ts";
-import type { ModulePermissions } from "./security/permissions.ts";
 import { SecurityEnforcer } from "./security/enforcer.ts";
+import { ModuleCallHandler } from "./module-call-handler.ts";
+import {
+  createConfigReloadHandler,
+  createPermissionReloadHandler,
+  createModuleReloadHandler,
+} from "./signal-handlers.ts";
+import { renderBanner } from "./banner.ts";
 
 function readVersion(): string {
   const baseDir = join(dirname(new URL(import.meta.url).pathname), "..");
@@ -41,6 +47,7 @@ export default class Kernel {
   private lifecycle: LifecycleManager;
   private permissionStore: PermissionStore;
   private enforcer: SecurityEnforcer;
+  private moduleCallHandler!: ModuleCallHandler;
 
   private modules: DiscoveredModule[] = [];
   /** Guards against concurrent/duplicate shutdown calls. */
@@ -100,6 +107,14 @@ export default class Kernel {
 
     this._config = config;
     this._bootTime = Date.now();
+
+    // Recreate enforcer with configured enforcement mode (enforcer has no state yet)
+    this.enforcer = new SecurityEnforcer(
+      this.permissionStore,
+      this.logger,
+      config.security?.enforcementMode,
+    );
+
     const configSource = join(getPonsHome(), "config.yaml");
     this.printStartupBanner(configSource, [configSource]);
 
@@ -112,9 +127,18 @@ export default class Kernel {
       this.bus,
       { config, workspacePath: getPonsHome(), projectRoot: getPonsHome() },
       (moduleId, method, params) =>
-        this.handleModuleCall(moduleId, method, params),
+        this.moduleCallHandler.handle(moduleId, method, params),
       this.enforcer,
       this.permissionStore,
+    );
+
+    // Module call handler — created after lifecycle so it can reference it
+    this.moduleCallHandler = new ModuleCallHandler(
+      this.configManager,
+      this.enforcer,
+      this.permissionStore,
+      this.lifecycle,
+      this.logger,
     );
 
     return this;
@@ -145,117 +169,28 @@ export default class Kernel {
       this.shutdown().catch(console.error);
     });
 
-    // Config hot-reload: CLI sends SIGUSR1 after writing config
-    this.addSignalHandler("SIGUSR1", () => {
-      if (this._shuttingDown) return;
-      this.logger.info("Received SIGUSR1 — reloading config");
-      try {
-        const oldConfig = structuredClone(this.configManager.getAll());
-        this._config = this.configManager.load();
+    this.addSignalHandler("SIGUSR1", createConfigReloadHandler({
+      configManager: this.configManager,
+      lifecycle: this.lifecycle,
+      logger: this.logger,
+      isShuttingDown: () => this._shuttingDown,
+      getConfig: () => this._config,
+      setConfig: (config) => { this._config = config; },
+    }));
 
-        // Find changed top-level sections
-        const changedSections: string[] = [];
-        const allKeys = new Set([
-          ...Object.keys(oldConfig),
-          ...Object.keys(this._config as Record<string, unknown>),
-        ]);
-        for (const key of allKeys) {
-          if (
-            JSON.stringify(oldConfig[key]) !==
-              JSON.stringify((this._config as Record<string, unknown>)[key])
-          ) {
-            changedSections.push(key);
-          }
-        }
+    this.addSignalHandler("SIGUSR2", createPermissionReloadHandler({
+      permissionStore: this.permissionStore,
+      lifecycle: this.lifecycle,
+      logger: this.logger,
+      isShuttingDown: () => this._shuttingDown,
+    }));
 
-        if (changedSections.length === 0) {
-          this.logger.info("Config unchanged");
-          return;
-        }
-
-        // Compute affected modules for the config.reload event
-        const affectedModules = this.lifecycle.getRegistry().ids().filter((id) => {
-          const e = this.lifecycle.getRegistry().get(id);
-          return e?.status === 'ready' && e.manifest.configKey && changedSections.includes(e.manifest.configKey);
-        });
-        this.logger.info({ changedSections, affectedModules }, "config.reload");
-
-        // Update lifecycle init payload config reference
-        this.lifecycle.updateConfig(this._config);
-
-        // Notify affected modules
-        for (const moduleId of this.lifecycle.getRegistry().ids()) {
-          const entry = this.lifecycle.getRegistry().get(moduleId);
-          if (!entry || entry.status !== "ready") continue;
-
-          const manifest = entry.manifest;
-          const moduleConfigKey = manifest.configKey;
-          if (moduleConfigKey && changedSections.includes(moduleConfigKey)) {
-            // Security: send only the module's own config section and relevant changed sections
-            this.lifecycle.sendMessage(moduleId, {
-              type: "config:update" as const,
-              config: { [moduleConfigKey]: this.configManager.getSection(moduleConfigKey) },
-              changedSections: changedSections.filter((s: string) => s === moduleConfigKey),
-            });
-            this.logger.debug(
-              { module: moduleId, changedSections },
-              "Sent config:update",
-            );
-          }
-        }
-      } catch (err) {
-        this.logger.error({ error: String(err) }, "Failed to reload config");
-      }
-    });
-
-    // Permission hot-reload: CLI sends SIGUSR2 after granting/revoking permissions
-    this.addSignalHandler("SIGUSR2", () => {
-      if (this._shuttingDown) return;
-      this.logger.info("Received SIGUSR2 — reloading permissions");
-      try {
-        // PONS-006: Snapshot effective permissions before reload
-        const before = new Map<string, string>();
-        for (const moduleId of this.lifecycle.getRegistry().ids()) {
-          const entry = this.lifecycle.getRegistry().get(moduleId);
-          if (!entry || entry.status === "stopped" || entry.status === "crashed") continue;
-          const eff = this.permissionStore.getEffectivePermissions(moduleId);
-          before.set(moduleId, JSON.stringify(eff));
-        }
-
-        this.permissionStore.reload();
-        // Refresh enforcer capabilities so updated caps take effect immediately
-        this.lifecycle.refreshCapabilities();
-
-        // Compare and act on changes
-        for (const moduleId of this.lifecycle.getRegistry().ids()) {
-          const entry = this.lifecycle.getRegistry().get(moduleId);
-          if (!entry || entry.status === "stopped" || entry.status === "crashed") continue;
-
-          if (!this.permissionStore.isApproved(moduleId)) {
-            this.logger.warn({ module: moduleId }, "Permissions fully revoked — killing module");
-            this.lifecycle.kill(moduleId, "permissions-revoked");
-          } else {
-            const after = JSON.stringify(this.permissionStore.getEffectivePermissions(moduleId));
-            if (before.get(moduleId) !== after) {
-              this.logger.info({ module: moduleId }, "Permissions changed — restarting with updated flags");
-              this.lifecycle.restartWithUpdatedPermissions(moduleId);
-            }
-          }
-        }
-      } catch (err) {
-        this.logger.error({ error: String(err) }, "Failed to reload permissions");
-      }
-    });
-
-    // Module hot-reload: CLI sends SIGHUP after installing/uninstalling modules
-    this.addSignalHandler("SIGHUP", () => {
-      if (this._shuttingDown) return;
-      this.logger.info("Received SIGHUP — reloading permissions and re-discovering modules");
-      this.permissionStore.reload();
-      this.reloadModules().catch((err) => {
-        this.logger.error({ error: String(err) }, "Failed to reload modules");
-      });
-    });
+    this.addSignalHandler("SIGHUP", createModuleReloadHandler({
+      permissionStore: this.permissionStore,
+      logger: this.logger,
+      isShuttingDown: () => this._shuttingDown,
+      reloadModules: () => this.reloadModules(),
+    }));
 
     this.logger.info("Kernel running");
 
@@ -332,159 +267,11 @@ export default class Kernel {
     Deno.exit(0);
   }
 
-  private async handleModuleCall(
-    moduleId: string,
-    method: string,
-    params: unknown,
-  ): Promise<unknown> {
-    // Security: get the calling module's manifest for config scoping
-    const callerEntry = this.lifecycle.getRegistry().get(moduleId);
-    const callerConfigKey = callerEntry?.manifest?.configKey;
-
-    switch (method) {
-      case "config.get": {
-        const key = (params as { key: string }).key;
-        // Security: enforce config scope — module can only read its own section
-        const violation = this.enforcer.checkConfig(moduleId, key, callerConfigKey);
-        if (violation) {
-          this.enforcer.logViolation(violation);
-          this.lifecycle.kill(moduleId, "security-violation");
-          throw new Error(`Security violation: not permitted to read config key "${key}"`);
-        }
-        return this.configManager.get(key);
-      }
-      case "config.set": {
-        const { key, value } = params as { key: string; value: unknown };
-        // Security: enforce config scope — module can only write its own section
-        const violation = this.enforcer.checkConfig(moduleId, key, callerConfigKey);
-        if (violation) {
-          this.enforcer.logViolation(violation);
-          this.lifecycle.kill(moduleId, "security-violation");
-          throw new Error(`Security violation: not permitted to write config key "${key}"`);
-        }
-        const result = this.configManager.set(key, value);
-        if (result.success) {
-          const affected = this.configManager.getAffectedModules([key]);
-          const section = key.split(".")[0];
-          for (const modId of affected) {
-            if (modId === "__kernel__") continue;
-            const entry = this.lifecycle.getRegistry().get(modId);
-            if (entry?.process?.connected) {
-              // Security: send only the affected module's own config section
-              const modConfigKey = entry.manifest?.configKey;
-              this.lifecycle.sendMessage(modId, {
-                type: "config:update" as const,
-                config: modConfigKey ? { [modConfigKey]: this.configManager.getSection(modConfigKey) } : {},
-                changedSections: [section],
-              });
-            }
-          }
-        }
-        return result;
-      }
-      case "config.sections":
-        // Security: filter to return only the calling module's own section metadata
-        return this.configManager.listSections().filter(
-          (s: { key: string }) => s.key === callerConfigKey,
-        );
-      // Intentionally ungated: topology knowledge ≠ data access (RPC enforcement prevents unauthorized calls)
-      case "module.list":
-        return this.lifecycle.getRegistry().allPublic();
-      case "module.commands":
-        return this.lifecycle.getRegistry().getCommands();
-      case "service.discover":
-        return this.lifecycle.getRegistry().listServices();
-      case "service.resolve": {
-        const service = (params as { service: string }).service;
-        const resolved = this.lifecycle.getRegistry().resolveService(service);
-        if (!resolved) throw new Error(`Service not found: ${service}`);
-        return resolved;
-      }
-      case "permissions.request": {
-        const { permissions, reason } = params as { permissions: Partial<ModulePermissions>; reason?: string };
-
-        // Check if already granted
-        const effective = this.permissionStore.getEffectivePermissions(moduleId);
-        if (effective && isSubset(permissions, effective)) {
-          return { granted: true };
-        }
-
-        // Check if denied
-        if (this.permissionStore.isDenied(moduleId, permissions)) {
-          return { granted: false, denied: true };
-        }
-
-        // Check for existing pending
-        const existing = this.permissionStore.findExistingPending(moduleId, permissions);
-        if (existing) {
-          return { granted: false, pending: true, requestId: existing.id };
-        }
-
-        // Guard: module may have been removed from permissions store during SIGUSR2 race
-        if (!this.permissionStore.isApproved(moduleId)) {
-          return { granted: false, denied: true };
-        }
-
-        // Queue as pending
-        const pending = this.permissionStore.addPendingRequest(moduleId, permissions, reason);
-
-        // Send system notification (best-effort)
-        this.sendSystemNotification(moduleId);
-
-        this.logger.warn({ module: moduleId, requestId: pending.id }, 'Pending permission request');
-
-        return { granted: false, pending: true, requestId: pending.id };
-      }
-      case "permissions.check": {
-        const { permissions } = params as { permissions: Partial<ModulePermissions> };
-        const effective = this.permissionStore.getEffectivePermissions(moduleId);
-
-        if (!effective) return { granted: false, missing: permissions };
-
-        const missing: Partial<ModulePermissions> = {};
-        const fields: (keyof ModulePermissions)[] = ['net', 'read', 'write', 'env', 'run', 'sys'];
-        let allGranted = true;
-
-        for (const field of fields) {
-          const requested = (permissions as Record<string, string[]>)[field];
-          if (!requested) continue;
-          const granted = (effective as Record<string, string[]>)[field] || [];
-          const missingValues = requested.filter((v: string) => !granted.includes(v));
-          if (missingValues.length > 0) {
-            (missing as Record<string, string[]>)[field] = missingValues;
-            allGranted = false;
-          }
-        }
-
-        return { granted: allGranted, missing };
-      }
-      default:
-        throw new Error(`Unknown kernel method: ${method}`);
-    }
-  }
-
-  private sendSystemNotification(moduleId: string): void {
-    try {
-      // Sanitize moduleId — strip anything that could escape shell/AppleScript strings
-      const safeId = moduleId.replace(/[^a-zA-Z0-9_\-\.]/g, '');
-      // Fire-and-forget — never block the event loop for a best-effort notification
-      if (Deno.build.os === 'darwin') {
-        new Deno.Command('osascript', {
-          args: ['-e', `display notification "Module ${safeId} is waiting for permission approval" with title "Pons"`],
-          stdout: 'null', stderr: 'null',
-        }).spawn();
-      } else {
-        new Deno.Command('notify-send', {
-          args: ['Pons', `Module ${safeId} is waiting for permission approval`],
-          stdout: 'null', stderr: 'null',
-        }).spawn();
-      }
-    } catch { /* notification is best-effort */ }
-  }
-
   private printStartupBanner(configSource: string, loadedFiles: string[]) {
-    this.logger.info("─".repeat(60));
-    this.logger.info(`Pons Kernel v${this.version}`);
+    for (const line of renderBanner("PONS")) {
+      this.logger.info(`\x1b[36m${line}\x1b[0m`);
+    }
+    this.logger.info(`\x1b[36mKernel v${this.version}\x1b[0m`);
     this.logger.info({
       _groupItems: [
         { msg: `Config      ${configSource}` },
@@ -497,15 +284,4 @@ export default class Kernel {
       ],
     }, "Configuration");
   }
-}
-
-function isSubset(requested: Partial<ModulePermissions>, granted: ModulePermissions): boolean {
-  const fields: (keyof ModulePermissions)[] = ['net', 'read', 'write', 'env', 'run', 'sys'];
-  for (const field of fields) {
-    const reqValues = (requested as Record<string, string[]>)[field];
-    if (!reqValues || reqValues.length === 0) continue;
-    const grantedValues = (granted as Record<string, string[]>)[field] || [];
-    if (!reqValues.every((v: string) => grantedValues.includes(v))) return false;
-  }
-  return true;
 }

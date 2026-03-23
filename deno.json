@@ -4,8 +4,10 @@
   "license": "MIT",
 
   "imports": {
-    "@pons/sdk": "jsr:@pons/sdk@^0.3",
-    "@pons/sdk/config": "jsr:@pons/sdk@^0.3/config",
+    "@pons/sdk": "../sdk/src/index.ts",
+    "@pons/sdk/config": "../sdk/src/config.ts",
+    "ajv": "npm:ajv@^8",
+    "ajv-formats": "npm:ajv-formats@^3",
     "zod": "npm:zod@^3.24"
   },
 

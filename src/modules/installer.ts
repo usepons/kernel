@@ -126,8 +126,8 @@ export async function displayAndApprovePermissions(
     // PONS-004: Store IPC capabilities in the permission store
     // Derive from subscribes/requires when no explicit capabilities block exists
     const caps1 = manifest.capabilities ?? {
-      topics: manifest.subscribes ?? [],
-      services: [...(manifest.requires ?? []), ...((manifest as any).optionalRequires ?? [])],
+      topics: [...new Set([...(manifest.subscribes ?? []), ...(manifest.publishes ?? [])])],
+      services: [...new Set([...(manifest.requires ?? []), ...((manifest as any).optionalRequires ?? [])])],
     };
     permissionStore.approveCapabilities(manifest.id, caps1);
 
@@ -151,8 +151,8 @@ export async function displayAndApprovePermissions(
   // PONS-004: Store IPC capabilities in the permission store
   // Derive from subscribes/requires when no explicit capabilities block exists
   const caps2 = manifest.capabilities ?? {
-    topics: manifest.subscribes ?? [],
-    services: [...(manifest.requires ?? []), ...((manifest as any).optionalRequires ?? [])],
+    topics: [...new Set([...(manifest.subscribes ?? []), ...(manifest.publishes ?? [])])],
+    services: [...new Set([...(manifest.requires ?? []), ...((manifest as any).optionalRequires ?? [])])],
   };
   permissionStore.approveCapabilities(manifest.id, caps2);
 

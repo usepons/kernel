@@ -1,218 +1,27 @@
 /**
- * Security Permission Model — types, validation, Deno flag translation, and persistence.
+ * Security Permission Store — persistent storage for user-approved module permissions.
  *
- * Defines the permission schema that modules must declare in their module.json,
- * translates declared permissions into Deno CLI flags, and manages user-approved
- * permissions in ~/.pons/permissions.yaml.
+ * Manages user-approved permissions in ~/.pons/permissions.yaml, including base
+ * permissions, dynamic permissions, pending requests, and denied requests.
  */
+
+// Barrel re-exports for backward compatibility
+export * from './types.ts';
+export { modulePermissionsSchema, validatePermissions } from './validation.ts';
+export { translateToDenoFlags } from './deno-flags.ts';
+export { computeManifestHash } from './manifest-hash.ts';
 
 import { dirname, join } from 'jsr:@std/path@^1';
-import { encodeHex } from 'jsr:@std/encoding@^1/hex';
-import { crypto as stdCrypto } from 'jsr:@std/crypto@^1';
-import { z } from 'npm:zod@^3.24';
 import { parse as parseYaml, stringify as stringifyYaml } from 'npm:yaml@^2.7.1';
 import { getPonsHome } from '@pons/sdk';
-
-// ─── Permission Types ────────────────────────────────────────────
-
-export interface ModulePermissions {
-  net?: string[];
-  read?: string[];
-  write?: string[];
-  env?: string[];
-  run?: string[];
-  sys?: string[];
-}
-
-export interface GrantedPermission {
-  permissions: ModulePermissions;
-  manifestHash: string;
-  grantedAt: string;
-}
-
-export type SecurityViolationType = 'rpc' | 'topic' | 'config';
-
-export interface SecurityViolation {
-  timestamp: string;
-  moduleId: string;
-  type: SecurityViolationType;
-  resource: string;
-  action: 'deny' | 'kill';
-}
-
-// ─── Zod Schema ──────────────────────────────────────────────────
-
-const stringArraySchema = z.array(z.string()).optional().default([]);
-
-export const modulePermissionsSchema = z.object({
-  net: stringArraySchema,
-  read: stringArraySchema,
-  write: stringArraySchema,
-  env: z.array(z.string().refine(s => !s.includes('*'), { message: 'Glob patterns not allowed in env — use exact names' })).optional().default([]),
-  run: stringArraySchema,
-  sys: stringArraySchema,
-}).strict();
-
-/**
- * Validate a permissions block from module.json.
- * Returns the parsed permissions or throws on invalid input.
- */
-export function validatePermissions(raw: unknown): ModulePermissions {
-  return modulePermissionsSchema.parse(raw);
-}
-
-// ─── Binary Resolution ──────────────────────────────────────────
-
-/**
- * Check whether a binary exists on the host by attempting to resolve it.
- * Returns true if the binary is found in PATH, false otherwise.
- */
-function binaryExists(name: string): boolean {
-  try {
-    const cmd = Deno.build.os === 'windows' ? 'where' : 'which';
-    const result = new Deno.Command(cmd, {
-      args: [name],
-      stdout: 'null',
-      stderr: 'null',
-    }).outputSync();
-    return result.success;
-  } catch {
-    return false;
-  }
-}
-
-// ─── Deno Flag Translation ──────────────────────────────────────
-
-/**
- * Convert declared permissions into Deno CLI permission flags.
- * Never produces --allow-all.
- *
- * Relative paths in read/write permissions are resolved against moduleDir
- * (the directory containing the module's runner). This lets modules declare
- * "." to mean "my own directory" and have it translate to an absolute path.
- *
- * Run permissions are resolved lazily: binaries not found on the host
- * are silently omitted from --allow-run. This lets modules declare all
- * binaries they *may* call without requiring every one to be installed.
- */
-export function translateToDenoFlags(permissions: ModulePermissions, moduleDir?: string): string[] {
-  const flags: string[] = [];
-
-  const home = Deno.env.get('HOME') || Deno.env.get('USERPROFILE') || '';
-  const expandTilde = (p: string): string => p.startsWith('~/') ? join(home, p.slice(2)) : p;
-  const resolvePaths = (paths: string[]): string[] =>
-    paths.map(p => {
-      const expanded = expandTilde(p);
-      return expanded.startsWith('/') ? expanded : (moduleDir ? join(moduleDir, expanded) : expanded);
-    });
-
-  // net
-  if (permissions.net && permissions.net.length > 0) {
-    flags.push(`--allow-net=${permissions.net.join(',')}`);
-  } else {
-    flags.push('--deny-net');
-  }
-
-  // read
-  if (permissions.read && permissions.read.length > 0) {
-    flags.push(`--allow-read=${resolvePaths(permissions.read).join(',')}`);
-  } else {
-    flags.push('--deny-read');
-  }
-
-  // write
-  if (permissions.write && permissions.write.length > 0) {
-    flags.push(`--allow-write=${resolvePaths(permissions.write).join(',')}`);
-  } else {
-    flags.push('--deny-write');
-  }
-
-  // env — exact names only, no globs
-  if (permissions.env && permissions.env.length > 0) {
-    flags.push(`--allow-env=${permissions.env.join(',')}`);
-  } else {
-    flags.push('--deny-env');
-  }
-
-  // run — only include binaries found in PATH
-  if (permissions.run && permissions.run.length > 0) {
-    const DANGEROUS_BINARIES = new Set(['sh', 'bash', 'zsh', 'fish', 'csh', 'dash', 'cmd', 'powershell', 'pwsh', 'python', 'python3', 'node', 'ruby', 'perl']);
-    const available = permissions.run.filter(binaryExists);
-    const dangerous = available.filter(b => DANGEROUS_BINARIES.has(b));
-    if (dangerous.length > 0) {
-      console.warn(`[security] Blocking shell interpreters: ${dangerous.join(', ')} — these can bypass Deno sandbox restrictions`);
-    }
-    // Exclude dangerous binaries that can trivially escape the sandbox
-    const safe = available.filter(b => !DANGEROUS_BINARIES.has(b));
-    if (safe.length > 0) {
-      flags.push(`--allow-run=${safe.join(',')}`);
-    } else {
-      flags.push('--deny-run');
-    }
-  } else {
-    flags.push('--deny-run');
-  }
-
-  // sys — specific keys
-  if (permissions.sys && permissions.sys.length > 0) {
-    flags.push(`--allow-sys=${permissions.sys.join(',')}`);
-  } else {
-    flags.push('--deny-sys');
-  }
-
-  return flags;
-}
-
-// ─── Manifest Hash ──────────────────────────────────────────────
-
-/**
- * Compute SHA-256 hash of a module.json file for tamper detection.
- */
-export function computeManifestHash(manifestPath: string): string {
-  const content = Deno.readTextFileSync(manifestPath);
-  const data = new TextEncoder().encode(content);
-  const hash = stdCrypto.subtle.digestSync("SHA-256", data);
-  return encodeHex(new Uint8Array(hash));
-}
-
-// ─── Extended Permission Types ──────────────────────────────────
-
-/** IPC capabilities stored at approval time. */
-export interface StoredCapabilities {
-  services?: string[];
-  topics?: string[];
-}
-
-export interface ModulePermissionEntry {
-  base: ModulePermissions;
-  baseManifestHash: string;
-  baseGrantedAt: string;
-  firstSpawnAt?: string;
-  // PONS-004: Capabilities stored in the permission store, not self-asserted by modules
-  capabilities?: StoredCapabilities;
-  dynamic: ApprovedDynamicPermission[];
-  pending: PendingRequest[];
-  denied: DeniedRequest[];
-}
-
-export interface ApprovedDynamicPermission {
-  permissions: Partial<ModulePermissions>;
-  reason?: string;
-  grantedAt: string;
-}
-
-export interface PendingRequest {
-  id: string;
-  permissions: Partial<ModulePermissions>;
-  reason?: string;
-  requestedAt: string;
-}
-
-export interface DeniedRequest {
-  permissions: Partial<ModulePermissions>;
-  reason?: string;
-  deniedAt: string;
-}
+import { PERMISSION_FIELDS } from './constants.ts';
+import type {
+  ModulePermissions,
+  GrantedPermission,
+  StoredCapabilities,
+  ModulePermissionEntry,
+  PendingRequest,
+} from './types.ts';
 
 // ─── Permission Store ───────────────────────────────────────────
 
@@ -391,7 +200,7 @@ export class PermissionStore {
     if (!entry) return null;
 
     const effective: ModulePermissions = {};
-    const fields: (keyof ModulePermissions)[] = ['net', 'read', 'write', 'env', 'run', 'sys'];
+    const fields = PERMISSION_FIELDS;
 
     for (const field of fields) {
       const baseValues = entry.base[field] || [];
@@ -501,7 +310,7 @@ export class PermissionStore {
     const entry = this.data[moduleId];
     if (!entry || entry.denied.length === 0) return false;
 
-    const fields: (keyof ModulePermissions)[] = ['net', 'read', 'write', 'env', 'run', 'sys'];
+    const fields = PERMISSION_FIELDS;
     for (const denied of entry.denied) {
       for (const field of fields) {
         const deniedValues = denied.permissions[field];
@@ -525,7 +334,7 @@ export class PermissionStore {
     const entry = this.data[moduleId];
     if (!entry) return;
 
-    const fields: (keyof ModulePermissions)[] = ['net', 'read', 'write', 'env', 'run', 'sys'];
+    const fields = PERMISSION_FIELDS;
 
     entry.denied = entry.denied.filter(denied => {
       for (const field of fields) {
@@ -551,7 +360,7 @@ export class PermissionStore {
     const entry = this.data[moduleId];
     if (!entry) return null;
 
-    const fields: (keyof ModulePermissions)[] = ['net', 'read', 'write', 'env', 'run', 'sys'];
+    const fields = PERMISSION_FIELDS;
 
     for (const pending of entry.pending) {
       let allCovered = true;
@@ -630,3 +439,20 @@ export class PermissionStore {
     return Object.keys(this.data);
   }
 }
+
+/**
+ * Check whether `requested` permissions are a subset of `granted`.
+ * Returns true if every requested value is present in granted.
+ */
+export function isSubset(requested: Partial<ModulePermissions>, granted: ModulePermissions): boolean {
+  for (const field of PERMISSION_FIELDS) {
+    const reqValues = (requested as Record<string, string[]>)[field];
+    if (!reqValues || reqValues.length === 0) continue;
+    const grantedValues = (granted as Record<string, string[]>)[field] || [];
+    if (!reqValues.every((v: string) => grantedValues.includes(v))) return false;
+  }
+  return true;
+}
+
+// Re-export constants for barrel imports
+export { PERMISSION_FIELDS } from './constants.ts';

@@ -3,56 +3,59 @@
  * validates config.yaml, provides CRUD, doctor diagnostics.
  */
 
-import { join, toFileUrl } from "jsr:@std/path@^1";
+import { join } from "jsr:@std/path@^1";
 import { parse as parseYaml, stringify as stringifyYaml } from "npm:yaml@^2.7.1";
 import { z } from "npm:zod@^3.24";
 import type { ZodObject, ZodRawShape } from "npm:zod@^3.24";
 import { getPonsHome } from "@pons/sdk";
 import type { ModuleManifest } from "@pons/sdk";
-import type { ConfigSchemaDefinition } from "@pons/sdk/config";
 import type {
   KernelConfig,
   DiagnosticReport,
-  DiagnosticIssue,
   ValidationResult,
 } from "./types.ts";
+import { discoverSchemas } from "./schema-discovery.ts";
+import type { RegisteredSchema } from "./schema-discovery.ts";
+import { ConfigDoctor } from "./diagnostics.ts";
 
-// Kernel built-in schema (defined here to avoid JSR slow-type export issues in types.ts)
-const kernelBuiltinSchema = z.object({
-  logging: z.object({
-    level: z.enum(["trace", "debug", "info", "warn", "error", "fatal"]).default("info"),
-    levels: z.record(z.enum(["trace", "debug", "info", "warn", "error", "fatal"])).default({}),
-  }).default({}),
-  lifecycle: z.object({
-    healthIntervalMs: z.number().int().min(1000).default(30_000),
-    pingTimeoutMs: z.number().int().min(1000).default(10_000),
-    healthMaxFailures: z.number().int().min(1).default(3),
-    readyTimeoutMs: z.number().int().min(1000).default(30_000),
-    requiresTimeoutMs: z.number().int().min(1000).default(30_000),
-    shutdownGraceMs: z.number().int().min(1000).default(5_000),
-    maxRestarts: z.number().int().min(0).default(5),
-    maxRestartBackoffMs: z.number().int().min(1000).default(60_000),
-    rpcTimeoutMs: z.number().int().min(1000).default(30_000),
-  }).default({}),
-});
+// Re-export extracted modules for backward compatibility
+export { discoverSchemas } from "./schema-discovery.ts";
+export type { RegisteredSchema } from "./schema-discovery.ts";
+export { ConfigDoctor } from "./diagnostics.ts";
 
 const UNSAFE_KEYS = new Set(["__proto__", "constructor", "prototype"]);
-
-interface RegisteredSchema {
-  configKey: string;
-  schema: ZodObject<ZodRawShape>;
-  meta?: { description?: string; labels?: Record<string, string> };
-  moduleId: string;
-}
 
 export class ConfigManager {
   private schemas = new Map<string, RegisteredSchema>();
   private appSchema: ZodObject<ZodRawShape> | null = null;
   private configData: Record<string, unknown> = {};
   private configPath: string;
+  private doctor: ConfigDoctor;
 
   constructor(configPath?: string) {
     this.configPath = configPath ?? join(getPonsHome(), "config.yaml");
+    this.doctor = new ConfigDoctor({
+      get configData() { return {} as Record<string, unknown>; },
+      get appSchema() { return null; },
+      get schemaKeys() { return new Set<string>(); },
+      set: () => ({ success: false, error: "Not initialized" }),
+      save: () => {},
+    });
+    this.rebuildDoctor();
+  }
+
+  /**
+   * Rebuild the ConfigDoctor instance with current state.
+   */
+  private rebuildDoctor(): void {
+    const self = this;
+    this.doctor = new ConfigDoctor({
+      get configData() { return self.configData; },
+      get appSchema() { return self.appSchema; },
+      get schemaKeys() { return new Set(self.schemas.keys()); },
+      set: (keyPath: string, value: unknown) => self.set(keyPath, value),
+      save: () => self.save(),
+    });
   }
 
   // ─── Schema Discovery ──────────────────────────────────────
@@ -62,94 +65,9 @@ export class ConfigManager {
    * Also registers kernel built-in schemas.
    */
   async discoverSchemas(modules: Array<{ manifest: ModuleManifest; moduleDir: string }>): Promise<void> {
-    // Register kernel built-in schema keys
-    const builtinShape = kernelBuiltinSchema.shape;
-    for (const [key, fieldSchema] of Object.entries(builtinShape)) {
-      this.schemas.set(key, {
-        configKey: key,
-        schema: z.object({ [key]: fieldSchema }) as unknown as ZodObject<ZodRawShape>,
-        meta: { description: `Kernel ${key} configuration` },
-        moduleId: "__kernel__",
-      });
-    }
-
-    // Import module schemas
-    for (const { manifest, moduleDir } of modules) {
-      if (!manifest.configSchema || !manifest.configKey) continue;
-
-      try {
-        const schemaPath = join(moduleDir, manifest.configSchema);
-        try { Deno.statSync(schemaPath); } catch { continue; }
-
-        const realPath = Deno.realPathSync(schemaPath);
-        const realModuleDir = Deno.realPathSync(moduleDir);
-        // Security: verify schema path is within the module directory (prevent path traversal)
-        if (!realPath.startsWith(realModuleDir + '/')) {
-          console.warn(`[config] Schema path escapes module directory for "${manifest.id}" — skipping`);
-          continue;
-        }
-        // Security: validate schema file extension — allow .ts, .js, or .json
-        const isJson = realPath.endsWith('.json');
-        const isTsJs = realPath.endsWith('.ts') || realPath.endsWith('.js');
-        if (!isJson && !isTsJs) {
-          console.warn(`[config] Schema file must be .ts, .js, or .json for "${manifest.id}" — skipping`);
-          continue;
-        }
-
-        if (isJson) {
-          // JSON Schema — parse and convert to Zod passthrough (no code execution)
-          const jsonContent = Deno.readTextFileSync(realPath);
-          const jsonSchema = JSON.parse(jsonContent);
-          // Use a permissive Zod object with passthrough for JSON Schema defined configs
-          const looseSchema = z.object({}).passthrough().default({});
-          this.schemas.set(manifest.configKey, {
-            configKey: manifest.configKey,
-            schema: z.object({ [manifest.configKey]: looseSchema }) as unknown as ZodObject<ZodRawShape>,
-            meta: { description: jsonSchema.description ?? `Config for ${manifest.id}` },
-            moduleId: manifest.id,
-          });
-        } else {
-          // TypeScript/JS schema — static analysis + dynamic import
-          const schemaSource = Deno.readTextFileSync(realPath);
-          const FORBIDDEN_PATTERNS = [
-            /\bDeno\s*\.\s*(run|Command|exec|remove|writeFile|writeTextFile|mkdir|rename|chmod|chown|kill|exit)\b/,
-            /\bDeno\s*\.\s*(listen|connect|listenTls|connectTls|serve)\b/,
-            /\bchild_process\b/,
-            /\bimport\s*\(/,       // dynamic imports
-            /\brequire\s*\(/,
-            /\beval\s*\(/,
-            /\bnew\s+Function\s*\(/,
-            /\bfetch\s*\(/,
-            /\bWebSocket\b/,
-          ];
-          const hasForbidden = FORBIDDEN_PATTERNS.find(p => p.test(schemaSource));
-          if (hasForbidden) {
-            console.warn(`[config] Schema file for "${manifest.id}" contains forbidden API pattern — skipping (matched: ${hasForbidden})`);
-            continue;
-          }
-
-          const mod = await import(toFileUrl(realPath).href);
-          const definition: ConfigSchemaDefinition = mod.default;
-
-          if (!definition?.schema) continue;
-
-          this.schemas.set(manifest.configKey, {
-            configKey: manifest.configKey,
-            schema: z.object({ [manifest.configKey]: definition.schema }) as unknown as ZodObject<ZodRawShape>,
-            meta: definition.meta ? {
-              description: definition.meta.description,
-              labels: definition.meta.labels as Record<string, string> | undefined,
-            } : undefined,
-            moduleId: manifest.id,
-          });
-        }
-      } catch (err) {
-        // Log warning but don't fail — module will run with raw config
-        console.warn(`[config] Failed to load schema for module "${manifest.id}": ${err instanceof Error ? err.message : String(err)}`);
-      }
-    }
-
+    this.schemas = await discoverSchemas(modules);
     this.rebuildAppSchema();
+    this.rebuildDoctor();
   }
 
   /**
@@ -168,6 +86,9 @@ export class ConfigManager {
   private rebuildAppSchema(): void {
     const shape: Record<string, z.ZodTypeAny> = {};
     for (const [key, reg] of this.schemas) {
+      // Skip JSON Schema sections — they validate independently via ajv
+      if (!reg.schema) continue;
+
       const innerShape = (reg.schema as z.ZodObject<Record<string, z.ZodTypeAny>>).shape;
       const fieldSchema = innerShape[key];
       if (fieldSchema) {
@@ -193,6 +114,13 @@ export class ConfigManager {
       console.warn(`[config] Config file not found at ${this.configPath} — using schema defaults`);
       if (this.appSchema) {
         this.configData = this.appSchema.parse({}) as Record<string, unknown>;
+      }
+      // Apply ajv defaults for JSON Schema sections
+      for (const [key, reg] of this.schemas) {
+        if (!reg.ajvValidate) continue;
+        const dataCopy = {};
+        reg.ajvValidate(dataCopy);
+        this.configData[key] = dataCopy;
       }
       return this.configData as KernelConfig;
     }
@@ -226,6 +154,23 @@ export class ConfigManager {
       }
     } else {
       this.configData = parsed;
+    }
+
+    // Validate JSON Schema sections independently via ajv
+    for (const [key, reg] of this.schemas) {
+      if (!reg.ajvValidate) continue;
+      const sectionData = this.configData[key] ?? {};
+      const dataCopy = structuredClone(sectionData);
+      const valid = reg.ajvValidate(dataCopy);
+      if (valid) {
+        // ajv may have applied defaults via useDefaults — store the enriched copy
+        this.configData[key] = dataCopy;
+      } else {
+        const errors = (reg.ajvValidate.errors ?? [])
+          .map(e => `${key}${e.instancePath}: ${e.message}`)
+          .join("; ");
+        console.warn(`[config] Validation warnings (${key}): ${errors}`);
+      }
     }
 
     return this.configData as KernelConfig;
@@ -283,14 +228,28 @@ export class ConfigManager {
     // Validate if we have a schema
     const sectionKey = parts[0];
     const sectionSchema = this.schemas.get(sectionKey);
-    if (sectionSchema && this.appSchema) {
-      const result = this.appSchema.safeParse(testData);
-      if (!result.success) {
-        const issue = result.error.issues[0];
-        return {
-          success: false,
-          error: `Validation failed at ${issue.path.join(".")}: ${issue.message}`,
-        };
+    if (sectionSchema) {
+      if (sectionSchema.ajvValidate) {
+        // JSON Schema validation via ajv
+        const sectionData = structuredClone(testData[sectionKey] ?? {});
+        const valid = sectionSchema.ajvValidate(sectionData);
+        if (!valid) {
+          const firstError = sectionSchema.ajvValidate.errors?.[0];
+          return {
+            success: false,
+            error: `Validation failed at ${sectionKey}${firstError?.instancePath ?? ""}: ${firstError?.message ?? "unknown error"}`,
+          };
+        }
+      } else if (this.appSchema) {
+        // Zod validation
+        const result = this.appSchema.safeParse(testData);
+        if (!result.success) {
+          const issue = result.error.issues[0];
+          return {
+            success: false,
+            error: `Validation failed at ${issue.path.join(".")}: ${issue.message}`,
+          };
+        }
       }
     }
 
@@ -353,85 +312,14 @@ export class ConfigManager {
    * Diagnose config against all known schemas.
    */
   diagnose(): DiagnosticReport {
-    const issues: DiagnosticIssue[] = [];
-
-    if (!this.appSchema) {
-      return { issues, valid: true };
-    }
-
-    const result = this.appSchema.safeParse(this.configData);
-    if (result.success) {
-      const knownKeys = new Set(this.schemas.keys());
-      for (const key of Object.keys(this.configData)) {
-        if (!knownKeys.has(key)) {
-          issues.push({
-            path: key,
-            type: "unknown",
-            message: `Unknown config section "${key}" — no module claims this key`,
-            fixable: true,
-            suggestedValue: undefined,
-          });
-        }
-      }
-      return { issues, valid: issues.length === 0 };
-    }
-
-    let defaults: Record<string, unknown> = {};
-    try {
-      defaults = this.appSchema.parse({}) as Record<string, unknown>;
-    } catch { /* no defaults available */ }
-
-    for (const issue of result.error.issues) {
-      const path = issue.path.join(".");
-      let suggestedValue: unknown = undefined;
-      let fixable = false;
-
-      let def: unknown = defaults;
-      for (const part of issue.path) {
-        if (def == null || typeof def !== "object") { def = undefined; break; }
-        def = (def as Record<string, unknown>)[String(part)];
-      }
-      if (def !== undefined) {
-        suggestedValue = def;
-        fixable = true;
-      }
-
-      const type = issue.code === "invalid_type" && issue.received === "undefined" ? "missing" : "invalid";
-
-      issues.push({
-        path: path || "(root)",
-        type,
-        message: issue.message,
-        fixable,
-        suggestedValue,
-      });
-    }
-
-    return { issues, valid: false };
+    return this.doctor.diagnose();
   }
 
   /**
    * Auto-fix fixable issues from a diagnostic report.
    */
   fix(report: DiagnosticReport): void {
-    for (const issue of report.issues) {
-      if (!issue.fixable) continue;
-
-      if (issue.type === "unknown") {
-        const parts = issue.path.split(".");
-        let target: Record<string, unknown> = this.configData;
-        let valid = true;
-        for (let i = 0; i < parts.length - 1; i++) {
-          if (target[parts[i]] == null || typeof target[parts[i]] !== "object") { valid = false; break; }
-          target = target[parts[i]] as Record<string, unknown>;
-        }
-        if (!valid) continue;
-        delete target[parts[parts.length - 1]];
-      } else if (issue.suggestedValue !== undefined) {
-        this.set(issue.path, issue.suggestedValue);
-      }
-    }
-    this.save();
+    this.doctor.fix(report);
   }
 
   // ─── Hot-reload notification ───────────────────────────────

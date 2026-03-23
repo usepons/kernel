@@ -7,8 +7,15 @@ export interface LoggingConfig {
   levels: Record<string, LogLevel>;
 }
 
+export type SecurityEnforcementMode = 'strict' | 'warn' | 'off';
+
+export interface SecurityConfig {
+  enforcementMode?: SecurityEnforcementMode;
+}
+
 export type KernelConfig = {
   logging: LoggingConfig;
+  security?: SecurityConfig;
 } & Record<string, unknown>;
 
 // ─── Diagnostic types ────────────────────────────────────────
