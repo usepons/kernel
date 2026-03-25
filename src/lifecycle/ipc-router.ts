@@ -1,13 +1,26 @@
 /**
- * IPC Router — message dispatching, kernel-to-module calls, RPC forwarding.
+ * IpcRouter — the post office of the kernel.
  *
- * Owns: pendingCalls, pendingRpc state.
- * All send() calls go through this class (it writes to process stdin).
+ * Every message that travels between the kernel and a module passes through here.
+ * Inbound: the router receives raw validated messages from module stdout and decides
+ * who handles them — ready announcements go to the ServiceDirectory, log lines go to
+ * the logger, RPC responses wake up pending promises. Outbound: every `send()` call
+ * writes a JSON line to the module's stdin.
+ *
+ * The router also owns the pending-call and pending-RPC maps. When a module (or the
+ * kernel itself) issues a call and waits for a response, the router stores the promise
+ * resolver here and matches it when the response arrives. Timeouts are enforced here
+ * too — a module that never responds doesn't leak promises forever.
+ *
+ * Cleanup happens via the TypedEmitter: when a module exits, the `module:exit` event
+ * triggers rejection of all its outstanding promises so callers get an error rather
+ * than hanging indefinitely.
  */
 
 import type { KernelMessage, ModuleMessage } from '@pons/sdk';
 import { writeModuleLog, writeModuleLogGroup } from '../logs/logger.ts';
 import type { LifecycleContext, PendingCall, PendingRpc } from './types.ts';
+import type { TypedEmitter } from './typed-emitter.ts';
 
 // ─── Callback Interfaces ──────────────────────────────────────
 
@@ -29,7 +42,13 @@ export class IpcRouter {
   constructor(
     private readonly ctx: LifecycleContext,
     private readonly callbacks: IpcRouterCallbacks,
-  ) {}
+    events: TypedEmitter,
+  ) {
+    events.on("module:exit", (moduleId) => {
+      this.cleanupModuleCalls(moduleId);
+      this.cleanupModuleRpcs(moduleId);
+    });
+  }
 
   // ─── Message Dispatching ──────────────────────────────────────
 

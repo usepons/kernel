@@ -21,6 +21,9 @@ const benchmarks = [
   { name: "Memory (RSS)", file: "memory.ts" },
   { name: "Shutdown Time", file: "shutdown-time.ts" },
   { name: "Module Spawn", file: "module-spawn.ts" },
+  { name: "IPC Latency", file: "ipc-latency.ts" },
+  { name: "RPC Latency", file: "rpc-latency.ts" },
+  { name: "Module Restart", file: "module-restart.ts" },
   { name: "Scale Test", file: "scale.ts" },
 ];
 

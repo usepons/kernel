@@ -1,8 +1,10 @@
-/**
- * Process Pool — spawning, killing, restarting, and hot-swapping module processes.
- *
- * Owns: processForker, stderrBuffers, spawnTimestamps, restartLocks, restartTimers, restartResetTimers.
- */
+// The ProcessPool is where modules become real OS processes. It handles the full
+// lifecycle of a module's process: forking it with the right Deno permissions, feeding
+// it IPC messages, watching for unexpected exits, and deciding whether to restart or
+// give up. Restart logic uses exponential backoff with a stability heuristic — if a
+// module stays alive for 60 seconds, we consider it healthy and reset the failure
+// counter. This prevents transient errors (a flaky network call at startup) from
+// permanently exhausting the restart budget.
 
 import type { KernelMessage, ModuleManifest } from '@pons/sdk';
 import type { DiscoveredModule } from '../module/loader.ts';
@@ -10,14 +12,11 @@ import { ProcessForker } from '../process/process-forker.ts';
 import { validateModuleMessage } from '../ipc/validation.ts';
 import type { LifecycleContext } from './types.ts';
 import { PROTOCOL_VERSION } from './types.ts';
+import type { TypedEmitter } from './typed-emitter.ts';
 
 // ─── Callback Interfaces ──────────────────────────────────────
 
 export interface ProcessPoolCallbacks {
-  /** Called when a module exits unexpectedly so the facade can clean up IPC state. */
-  onModuleExitCleanup(moduleId: string): void;
-  /** Clear health timers, ready timeouts, and pending-ready state for a module. */
-  clearModuleTimers(moduleId: string): void;
   /** Publish a system lifecycle event to bus subscribers. */
   publishLifecycleEvent(topic: string, payload: Record<string, unknown>): void;
   /** Send a kernel message to a module (routed through ipc-router). */
@@ -34,8 +33,11 @@ export interface ProcessPoolCallbacks {
 
 export class ProcessPool {
   private readonly processForker: ProcessForker;
+  // Last stderr output per module — kept so we can include it in crash diagnostics
   private stderrBuffers = new Map<string, string>();
   private spawnTimestamps = new Map<string, number>();
+  // Per-module promise chain that serializes kill/restart operations. Without this,
+  // a health-check kill racing with a signal-triggered restart could double-spawn.
   private restartLocks = new Map<string, Promise<void>>();
   private restartTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private restartResetTimers = new Map<string, ReturnType<typeof setTimeout>>();
@@ -44,6 +46,7 @@ export class ProcessPool {
     private readonly ctx: LifecycleContext,
     private readonly initPayload: { config: unknown; workspacePath: string; projectRoot: string },
     private readonly callbacks: ProcessPoolCallbacks,
+    private readonly events: TypedEmitter,
   ) {
     this.processForker = new ProcessForker(ctx.logger, ctx.permissionStore, initPayload.projectRoot);
   }
@@ -148,7 +151,7 @@ export class ProcessPool {
     this.callbacks.publishLifecycleEvent('system:module:stopping', { moduleId, tier });
     this.ctx.registry.setStatus(moduleId, 'killed');
     this.clearTimers(moduleId);
-    this.callbacks.clearModuleTimers(moduleId);
+    this.events.emit('module:timers:clear', moduleId);
 
     if (entry.process?.connected) {
       this.callbacks.send(moduleId, { type: 'shutdown' });
@@ -161,7 +164,7 @@ export class ProcessPool {
       }
     }
 
-    this.callbacks.onModuleExitCleanup(moduleId);
+    this.events.emit('module:exit', moduleId);
     this.ctx.bus.unsubscribe(moduleId);
     this.ctx.enforcer?.removeModuleCapabilities(moduleId);
     this.ctx.registry.setStatus(moduleId, 'stopped');
@@ -230,8 +233,8 @@ export class ProcessPool {
     if (!entry || entry.status === 'stopped' || entry.status === 'killed') return;
 
     this.clearTimers(moduleId);
-    this.callbacks.clearModuleTimers(moduleId);
-    this.callbacks.onModuleExitCleanup(moduleId);
+    this.events.emit('module:timers:clear', moduleId);
+    this.events.emit('module:exit', moduleId);
 
     const restarts = this.ctx.registry.incrementRestarts(moduleId);
     const lastStderr = this.stderrBuffers.get(moduleId);

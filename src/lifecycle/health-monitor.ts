@@ -5,6 +5,7 @@
  */
 
 import type { LifecycleContext } from './types.ts';
+import type { TypedEmitter } from './typed-emitter.ts';
 
 // ─── Callback Interfaces ──────────────────────────────────────
 
@@ -24,7 +25,12 @@ export class HealthMonitor {
   constructor(
     private readonly ctx: LifecycleContext,
     private readonly callbacks: HealthMonitorCallbacks,
-  ) {}
+    events: TypedEmitter,
+  ) {
+    events.on("module:timers:clear", (moduleId) => {
+      this.clearAll(moduleId);
+    });
+  }
 
   startHealthCheck(moduleId: string): void {
     this.clearHealthTimer(moduleId);

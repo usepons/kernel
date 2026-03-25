@@ -1,11 +1,17 @@
-import { dirname, join, resolve } from "jsr:@std/path@^1";
+// The Kernel is the entry point and orchestrator for the entire Pons system. It owns
+// nothing application-specific — its only job is to wire together the subsystems that
+// manage module processes, route IPC messages, enforce security, and handle configuration.
+// Boot and start are deliberately separate phases: boot discovers and validates the world
+// (modules, config, permissions), while start brings it to life (spawns processes, listens
+// for signals). This separation lets callers inspect the boot result before committing.
+
+import { join, resolve } from "jsr:@std/path@^1";
 import { getPonsHome } from "@pons/sdk";
 import { ConfigManager } from "./config/manager.ts";
-import { createLogger, closeLogger } from "./logs/logger.ts";
+import { createLogger } from "./logs/logger.ts";
 import type { KernelLogger } from "./logs/logger.ts";
 import { MessageBus } from "./messaging/bus.ts";
 import { LifecycleManager } from "./lifecycle.ts";
-import { ModuleLoader } from "./module/loader.ts";
 import type { DiscoveredModule } from "./module/loader.ts";
 import type { KernelConfig, LogLevel } from "./config/types.ts";
 import { PermissionStore } from "./security/permissions.ts";
@@ -16,24 +22,9 @@ import {
   createPermissionReloadHandler,
   createModuleReloadHandler,
 } from "./signal-handlers.ts";
-import { renderBanner } from "./banner.ts";
-
-function readVersion(): string {
-  const baseDir = join(dirname(new URL(import.meta.url).pathname), "..");
-  // module.json is stamped with the version by the CLI after JSR download
-  const manifestPath = join(baseDir, "module.json");
-  try {
-    const manifest = JSON.parse(Deno.readTextFileSync(manifestPath));
-    if (manifest.version) return manifest.version;
-  } catch { /* fall through */ }
-  // Fallback: deno.json (available in local dev, stripped by JSR)
-  try {
-    const pkg = JSON.parse(Deno.readTextFileSync(join(baseDir, "deno.json")));
-    return pkg.version || "0.0.0";
-  } catch {
-    return "0.0.0";
-  }
-}
+import { ControlServer } from "./control/server.ts";
+import { KernelBootstrap, readVersion } from "./kernel-bootstrap.ts";
+import { KernelRuntime } from "./kernel-runtime.ts";
 
 export default class Kernel {
   readonly version: string;
@@ -42,19 +33,18 @@ export default class Kernel {
 
   private _config?: KernelConfig;
   private configManager: ConfigManager;
-  private moduleLoader: ModuleLoader;
   private bus: MessageBus;
   private lifecycle: LifecycleManager;
   private permissionStore: PermissionStore;
   private enforcer: SecurityEnforcer;
   private moduleCallHandler!: ModuleCallHandler;
+  private controlServer?: ControlServer;
 
   private modules: DiscoveredModule[] = [];
-  /** Guards against concurrent/duplicate shutdown calls. */
-  private _shuttingDown = false;
   private _bootTime = Date.now();
-  /** Stored signal handler references for cleanup on shutdown. */
-  private _signalHandlers: Array<{ signal: Deno.Signal; handler: () => void }> = [];
+
+  private readonly bootstrap: KernelBootstrap;
+  private readonly runtime: KernelRuntime;
 
   constructor(
     private readonly logLevel?: string,
@@ -73,55 +63,48 @@ export default class Kernel {
     this.bus = new MessageBus();
     this.permissionStore = new PermissionStore();
     this.enforcer = new SecurityEnforcer(this.permissionStore, this.logger);
-    this.moduleLoader = new ModuleLoader(this.modulesDir, this.permissionStore);
-    // LifecycleManager is created in boot() after config is loaded — not here.
+
+    this.bootstrap = new KernelBootstrap(
+      this.modulesDir,
+      this.configManager,
+      this.permissionStore,
+      this.logger,
+      this.logLevel,
+    );
+
+    // LifecycleManager depends on config (for health-check intervals, restart limits, etc.),
+    // so it can't be created until boot() loads and validates config.yaml.
     this.lifecycle = null!;
+
+    // Runtime holds references to mutable kernel state via closures. This indirection lets
+    // signal handlers and the control server read the latest config/modules without the
+    // kernel needing to push updates to them after every reload.
+    this.runtime = new KernelRuntime({
+      logger: this.logger,
+      bus: this.bus,
+      lifecycle: null!, // set in boot()
+      moduleLoader: this.bootstrap.moduleLoader,
+      configManager: this.configManager,
+      getConfig: () => this._config,
+      setConfig: (config) => { this._config = config; },
+      getModules: () => this.modules,
+      setModules: (modules) => { this.modules = modules; },
+      bootTime: this._bootTime,
+    });
   }
 
   /**
-   * Boot phase — load config, connect bus, discover modules, mount lifecycle.
+   * Boot phase — delegates to KernelBootstrap for discovery, config, and banner.
    */
   async boot(): Promise<this> {
-    // Discover modules first (need manifests for schema discovery)
-    this.modules = await this.moduleLoader.discover();
-
-    // Discover schemas from modules
-    await this.configManager.discoverSchemas(
-      this.modules.map((m) => ({
-        manifest: m.manifest,
-        moduleDir: m.moduleDir,
-      })),
-    );
-
-    // Load and validate config
-    const config = this.configManager.load();
-
-    if (this.logLevel) {
-      if (!config.logging) {
-        (config as Record<string, unknown>).logging = {
-          level: this.logLevel,
-          levels: {},
-        };
-      } else config.logging.level = this.logLevel as LogLevel;
-    }
+    const { config, modules, enforcer } = await this.bootstrap.boot();
 
     this._config = config;
     this._bootTime = Date.now();
+    this.modules = modules;
+    this.enforcer = enforcer;
 
-    // Recreate enforcer with configured enforcement mode (enforcer has no state yet)
-    this.enforcer = new SecurityEnforcer(
-      this.permissionStore,
-      this.logger,
-      config.security?.enforcementMode,
-    );
-
-    const configSource = join(getPonsHome(), "config.yaml");
-    this.printStartupBanner(configSource, [configSource]);
-
-    // Message bus
-    this.logger.info("Message bus ready");
-
-    // Lifecycle manager — single creation point (never in constructor)
+    // Created here — not in the constructor — because we need the loaded config
     this.lifecycle = new LifecycleManager(
       this.logger,
       this.bus,
@@ -132,14 +115,24 @@ export default class Kernel {
       this.permissionStore,
     );
 
-    // Module call handler — created after lifecycle so it can reference it
+    // ModuleCallHandler and LifecycleManager have a circular dependency: lifecycle
+    // routes module calls to the handler, and the handler queries lifecycle for module
+    // state. We break the cycle by creating lifecycle first with a lambda that captures
+    // `this.moduleCallHandler`, then creating the handler.
     this.moduleCallHandler = new ModuleCallHandler(
       this.configManager,
       this.enforcer,
       this.permissionStore,
       this.lifecycle,
       this.logger,
+      this.bus,
     );
+
+    // Patch the runtime's lifecycle reference — ugly but honest: we can't pass it
+    // at construction time because it doesn't exist yet. The alternative (a lazy getter)
+    // would hide the temporal dependency instead of making it explicit here.
+    (this.runtime as unknown as { deps: { lifecycle: LifecycleManager } }).deps.lifecycle = this.lifecycle;
+    (this.runtime as unknown as { deps: { bootTime: number } }).deps.bootTime = this._bootTime;
 
     return this;
   }
@@ -147,141 +140,62 @@ export default class Kernel {
   /**
    * Start phase — spawn discovered modules, register shutdown handlers.
    */
-  private addSignalHandler(signal: Deno.Signal, handler: () => void): void {
-    Deno.addSignalListener(signal, handler);
-    this._signalHandlers.push({ signal, handler });
-  }
-
-  private removeAllSignalHandlers(): void {
-    for (const { signal, handler } of this._signalHandlers) {
-      try { Deno.removeSignalListener(signal, handler); } catch { /* already removed */ }
-    }
-    this._signalHandlers = [];
-  }
-
   async start(): Promise<this> {
     this.lifecycle.spawnAll(this.modules);
 
-    this.addSignalHandler("SIGINT", () => {
-      this.shutdown().catch(console.error);
+    this.runtime.addSignalHandler("SIGINT", () => {
+      this.runtime.shutdown().catch(console.error);
     });
-    this.addSignalHandler("SIGTERM", () => {
-      this.shutdown().catch(console.error);
+    this.runtime.addSignalHandler("SIGTERM", () => {
+      this.runtime.shutdown().catch(console.error);
     });
 
-    this.addSignalHandler("SIGUSR1", createConfigReloadHandler({
+    this.runtime.addSignalHandler("SIGUSR1", createConfigReloadHandler({
       configManager: this.configManager,
       lifecycle: this.lifecycle,
       logger: this.logger,
-      isShuttingDown: () => this._shuttingDown,
+      isShuttingDown: () => this.runtime.isShuttingDown,
       getConfig: () => this._config,
       setConfig: (config) => { this._config = config; },
     }));
 
-    this.addSignalHandler("SIGUSR2", createPermissionReloadHandler({
+    this.runtime.addSignalHandler("SIGUSR2", createPermissionReloadHandler({
       permissionStore: this.permissionStore,
       lifecycle: this.lifecycle,
       logger: this.logger,
-      isShuttingDown: () => this._shuttingDown,
+      isShuttingDown: () => this.runtime.isShuttingDown,
     }));
 
-    this.addSignalHandler("SIGHUP", createModuleReloadHandler({
+    this.runtime.addSignalHandler("SIGHUP", createModuleReloadHandler({
       permissionStore: this.permissionStore,
       logger: this.logger,
-      isShuttingDown: () => this._shuttingDown,
-      reloadModules: () => this.reloadModules(),
+      isShuttingDown: () => this.runtime.isShuttingDown,
+      reloadModules: () => this.runtime.reloadModules(),
     }));
 
     this.logger.info("Kernel running");
 
-    // Write PID file for CLI process management
+    // The PID file is how `pons stop` and `pons status` find the running kernel.
+    // Written after signal handlers are registered so the kernel can't be killed
+    // before it's ready to handle shutdown gracefully.
     const runtimeDir = join(getPonsHome(), ".runtime");
     Deno.mkdirSync(runtimeDir, { recursive: true });
     Deno.writeTextFileSync(join(runtimeDir, "kernel.pid"), String(Deno.pid));
 
-    // Structured boot event — emitted after PID file write (spec §18, §2 Phase 4 step 16)
+    // The control server exposes a Unix socket for CLI commands (status, module
+    // list, etc.) without needing to go through signals or filesystem polling.
+    this.controlServer = new ControlServer(getPonsHome(), this.lifecycle, this.logger);
+    (this.runtime as unknown as { deps: { controlServer?: ControlServer } }).deps.controlServer = this.controlServer;
+    await this.controlServer.start();
+
+    // Emitted after PID file write so log consumers can correlate the boot event
+    // with a reachable process
     this.logger.info({ version: this.version, moduleCount: this.modules.length, configPath: join(getPonsHome(), "config.yaml") }, 'kernel.boot');
 
     return this;
   }
 
-  /**
-   * Re-discover modules and spawn any newly installed ones.
-   * Existing running modules are left untouched.
-   */
-  private async reloadModules(): Promise<void> {
-    const freshModules = await this.moduleLoader.discover();
-    const freshIds = new Set(freshModules.map((m) => m.manifest.id));
-    const runningIds = new Set(this.lifecycle.getRegistry().ids());
-
-    // Kill modules whose directories have been removed
-    for (const id of runningIds) {
-      if (!freshIds.has(id)) {
-        this.logger.info({ module: id }, "Module no longer on disk — stopping");
-        await this.lifecycle.kill(id, "uninstalled");
-      }
-    }
-
-    const newModules = freshModules.filter((m) => !runningIds.has(m.manifest.id));
-
-    // Re-discover config schemas for new modules
-    await this.configManager.discoverSchemas(
-      freshModules.map((m) => ({ manifest: m.manifest, moduleDir: m.moduleDir })),
-    );
-    this._config = this.configManager.load();
-
-    // Update lifecycle config reference
-    this.lifecycle.updateConfig(this._config);
-
-    if (newModules.length > 0) {
-      this.logger.info({ modules: newModules.map((m) => m.manifest.id) }, "Spawning new modules");
-      await this.lifecycle.spawnAll(newModules);
-    } else {
-      this.logger.info("No new modules found");
-    }
-
-    // Update internal module list
-    this.modules = freshModules;
-  }
-
   async shutdown(): Promise<void> {
-    if (this._shuttingDown) return;
-    this._shuttingDown = true;
-
-    this.removeAllSignalHandlers();
-
-    const uptime = Date.now() - this._bootTime;
-    this.logger.info("─".repeat(60));
-    this.logger.info({ reason: 'signal', uptime }, 'kernel.shutdown');
-
-    await this.lifecycle.stopAll();
-    await this.bus.close();
-
-    // Remove runtime files
-    const runtimeDir = join(getPonsHome(), ".runtime");
-    try { Deno.removeSync(join(runtimeDir, "kernel.pid")); } catch { /* may not exist */ }
-
-    // Flush and close log file handle before exit
-    closeLogger();
-
-    Deno.exit(0);
-  }
-
-  private printStartupBanner(configSource: string, loadedFiles: string[]) {
-    for (const line of renderBanner("PONS")) {
-      this.logger.info(`\x1b[36m${line}\x1b[0m`);
-    }
-    this.logger.info(`\x1b[36mKernel v${this.version}\x1b[0m`);
-    this.logger.info({
-      _groupItems: [
-        { msg: `Config      ${configSource}` },
-        ...(loadedFiles.length > 1
-          ? loadedFiles.slice(1).map((f) => ({ msg: `  merged     ${f}` }))
-          : []),
-        { msg: `Log level   ${this.logLevel || "info"}` },
-        { msg: `Home        ${getPonsHome()}` },
-        { msg: `Modules     ${this.modulesDir}` },
-      ],
-    }, "Configuration");
+    return this.runtime.shutdown();
   }
 }

@@ -1,12 +1,24 @@
-/** Adapts Deno's ChildProcess to a Node.js-like interface for kernel IPC. */
+/**
+ * DenoChildProcessWrapper — bridges Deno's native process API to a Node.js-style interface.
+ *
+ * Deno's ChildProcess speaks ReadableStream and WritableStream. The rest of the kernel
+ * was designed around Node-style event emitters (`proc.on('message', ...)`) because that
+ * model maps naturally to the message-passing protocol. Rather than rewrite the kernel's
+ * IPC layer, we wrap each spawned process in this adapter so the rest of the system
+ * never needs to know which runtime it's running on.
+ *
+ * IPC messages travel as newline-delimited JSON over stdout/stdin. This is intentional:
+ * it works across runtimes (Node, Deno, Bun, Python) without any native bindings, and
+ * it makes the protocol observable with nothing more than `cat`.
+ */
 
-import type { ChildProcessLike } from '../module/registry.ts';
+import type { ModuleProcess } from '../module/registry.ts';
 
 type MessageHandler = (msg: unknown) => void;
 type ExitHandler = (code: number | null, signal: string | null) => void;
 type DataHandler = (data: Uint8Array) => void;
 
-export class DenoChildProcessWrapper implements ChildProcessLike {
+export class DenoChildProcessWrapper implements ModuleProcess {
   readonly pid: number;
   connected: boolean = true;
 

@@ -62,10 +62,64 @@ async function reapproveAfterUpdate(moduleId: string, moduleDir: string, home: s
 /*  Command registration                                              */
 /* ------------------------------------------------------------------ */
 
+/** Send a command to the running kernel via Unix socket and return the response. */
+async function controlRequest(home: string, command: Record<string, unknown>): Promise<Record<string, unknown>> {
+  const sockPath = join(home, "run", "kernel.sock");
+  const conn = await Deno.connect({ transport: "unix", path: sockPath });
+  const encoder = new TextEncoder();
+  const decoder = new TextDecoder();
+
+  try {
+    await conn.write(encoder.encode(JSON.stringify(command) + "\n"));
+
+    const buf = new Uint8Array(4096);
+    const n = await conn.read(buf);
+    if (n === null) throw new Error("No response from kernel");
+
+    return JSON.parse(decoder.decode(buf.subarray(0, n)).trim());
+  } finally {
+    conn.close();
+  }
+}
+
 export function registerModuleCommands(program: Command): void {
   const modules = program
     .command("modules")
     .description("Manage installed modules");
+
+  /* ---- modules restart <module> ---- */
+  modules
+    .command("restart <module>")
+    .description("Restart a running module via the kernel control socket")
+    .option("--home <path>", "Override PONS_HOME directory")
+    .action(async (moduleName: string, opts: { home?: string }) => {
+      const home = opts.home || getPonsHome();
+
+      // Verify kernel is running
+      const pid = readPid(home);
+      if (pid === null || !isProcessRunning(pid)) {
+        printError("Kernel is not running. Start it first with `pons kernel start`.");
+        Deno.exitCode = 1;
+        return;
+      }
+
+      const spinner = ora(`Restarting module "${moduleName}"...`).start();
+
+      try {
+        const result = await controlRequest(home, { cmd: "module.restart", moduleId: moduleName });
+
+        if (result.ok) {
+          spinner.succeed(`Module ${chalk.green(moduleName)} restarted successfully.`);
+        } else {
+          spinner.fail(`Failed to restart "${moduleName}": ${result.error ?? "unknown error"}`);
+          Deno.exitCode = 1;
+        }
+      } catch (err) {
+        spinner.fail(`Could not connect to kernel control socket.`);
+        printError(err instanceof Error ? err.message : String(err));
+        Deno.exitCode = 1;
+      }
+    });
 
   /* ---- modules list ---- */
   modules
@@ -197,6 +251,61 @@ export function registerModuleCommands(program: Command): void {
       }
       console.log(table.toString());
       console.log();
+    });
+
+  /* ---- modules install-dir <path> ---- */
+  modules
+    .command("install-dir <path>")
+    .description("Install a module from a local directory (symlink + approve + spawn)")
+    .option("--home <path>", "Override PONS_HOME directory")
+    .option("--no-symlink", "Skip symlinking into ~/.kiria/modules/")
+    .option("--json", "Output as JSON")
+    .action(async (dirPath: string, opts: { home?: string; symlink?: boolean; json?: boolean }) => {
+      const json = opts.json ?? false;
+      const home = opts.home || getPonsHome();
+
+      // Verify kernel is running
+      const pid = readPid(home);
+      if (pid === null || !isProcessRunning(pid)) {
+        if (json) {
+          outputJson({ installed: false, error: "kernel not running" });
+        } else {
+          printError("Kernel is not running. Start it first with `pons kernel start`.");
+        }
+        Deno.exitCode = 1;
+        return;
+      }
+
+      const spinner = ora(`Installing module from "${dirPath}"...`).start();
+
+      try {
+        const result = await controlRequest(home, {
+          cmd: "module.install",
+          moduleDir: dirPath,
+          symlink: opts.symlink !== false,
+        });
+
+        if (result.ok) {
+          const data = result.data as { moduleId: string; manifestHash: string } | undefined;
+          spinner.succeed(`Module ${chalk.green(data?.moduleId ?? dirPath)} installed and approved.`);
+          if (json) {
+            outputJson({ installed: true, ...data });
+          }
+        } else {
+          spinner.fail(`Failed to install: ${result.error ?? "unknown error"}`);
+          if (json) {
+            outputJson({ installed: false, error: result.error });
+          }
+          Deno.exitCode = 1;
+        }
+      } catch (err) {
+        spinner.fail("Could not connect to kernel control socket.");
+        printError(err instanceof Error ? err.message : String(err));
+        if (json) {
+          outputJson({ installed: false, error: String(err) });
+        }
+        Deno.exitCode = 1;
+      }
     });
 
   /* ---- modules install <module> ---- */

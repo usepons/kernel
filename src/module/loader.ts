@@ -5,8 +5,7 @@
  * resolves entry points, and returns a list of discovered modules
  * ready to be spawned by the LifecycleManager.
  */
-
-import { join, resolve } from 'jsr:@std/path@^1';
+import { join, resolve } from '@std/path';
 import type { ModuleManifest } from '@pons/sdk';
 import { createLogger, type KernelLogger } from '../logs/logger.ts';
 import { modulePermissionsSchema, computeManifestHash } from '../security/permissions.ts';

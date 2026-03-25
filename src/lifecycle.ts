@@ -1,16 +1,11 @@
-/**
- * Module Lifecycle Manager — thin facade over four focused sub-systems.
- *
- * Sub-systems:
- *   - ProcessPool:       spawn, kill, restart, hot-swap, shutdown ordering
- *   - IpcRouter:         message dispatching, kernel-to-module calls, RPC forwarding
- *   - HealthMonitor:     periodic ping/pong health checks
- *   - ServiceDirectory:  module activation, dependency resolution, lifecycle events
- *
- * This facade wires the sub-systems together via callbacks, preserving the exact
- * same public API so kernel.ts, signal-handlers.ts, and module-call-handler.ts
- * require no changes.
- */
+// The LifecycleManager is the heart of the kernel — it's the single object that the
+// rest of the system talks to when it needs to spawn, kill, health-check, or message
+// a module. Internally it's a thin facade over four sub-systems (ProcessPool, IpcRouter,
+// HealthMonitor, ServiceDirectory), each owning a clear slice of responsibility. The
+// facade exists so callers don't need to know which sub-system handles what, and so the
+// sub-systems can be tested in isolation. The cross-cutting wiring happens here in the
+// constructor via callback objects — each sub-system declares the operations it needs
+// from others, and the facade satisfies them by delegation.
 
 import type { DiscoveredModule } from './module/loader.ts';
 import type { KernelLogger } from './logs/logger.ts';
@@ -25,6 +20,7 @@ import { IpcRouter } from './lifecycle/ipc-router.ts';
 import { ProcessPool } from './lifecycle/process-pool.ts';
 import { HealthMonitor } from './lifecycle/health-monitor.ts';
 import { ServiceDirectory } from './lifecycle/service-directory.ts';
+import { TypedEmitter } from './lifecycle/typed-emitter.ts';
 
 // ─── Lifecycle Manager (Facade) ───────────────────────────────
 
@@ -48,35 +44,33 @@ export class LifecycleManager {
     const limits = loadLimits(initPayload);
     this.ctx = { registry: this.registry, logger, bus, enforcer, permissionStore, limits };
 
-    // Wire sub-systems with cross-cutting callbacks
+    // Some events (module exit, timer cleanup) need to fan out to multiple sub-systems.
+    // Rather than having each sub-system hold references to all the others, we use a
+    // lightweight typed event bus for these broadcast-style signals.
+    const _events = new TypedEmitter();
+
+    // Each sub-system receives only the callbacks it needs from its peers. This keeps
+    // the dependency graph explicit — you can read any sub-system's callback interface
+    // to know exactly what external operations it relies on.
 
     this.ipcRouter = new IpcRouter(this.ctx, {
       onReady: (moduleId) => this.serviceDirectory.onReady(moduleId),
       onModuleCall: (moduleId, method, params) => this.onModuleCall(moduleId, method, params),
       kill: (moduleId, reason) => this.processPool.kill(moduleId, reason),
-    });
+    }, _events);
 
     this.processPool = new ProcessPool(this.ctx, initPayload, {
-      onModuleExitCleanup: (moduleId) => {
-        this.ipcRouter.cleanupModuleCalls(moduleId);
-        this.ipcRouter.cleanupModuleRpcs(moduleId);
-      },
-      clearModuleTimers: (moduleId) => {
-        this.healthMonitor.clearAll(moduleId);
-        this.serviceDirectory.clearPendingReady(moduleId);
-        this.serviceDirectory.clearReadyTimeout(moduleId);
-      },
       publishLifecycleEvent: (topic, payload) => this.serviceDirectory.publishLifecycleEvent(topic, payload),
       send: (moduleId, msg) => this.ipcRouter.send(moduleId, msg),
       handleMessage: (moduleId, msg) => this.ipcRouter.handleMessage(moduleId, msg),
       startReadyTimeout: (moduleId) => this.serviceDirectory.startReadyTimeout(moduleId),
       initModuleIpc: (moduleId) => this.ipcRouter.initModule(moduleId),
-    });
+    }, _events);
 
     this.healthMonitor = new HealthMonitor(this.ctx, {
       ping: (moduleId) => this.ipcRouter.ping(moduleId),
       kill: (moduleId, reason) => this.processPool.kill(moduleId, reason),
-    });
+    }, _events);
 
     this.serviceDirectory = new ServiceDirectory(this.ctx, {
       startHealthCheck: (moduleId) => this.healthMonitor.startHealthCheck(moduleId),
@@ -84,7 +78,7 @@ export class LifecycleManager {
       send: (moduleId, msg) => this.ipcRouter.send(moduleId, msg),
       kill: (moduleId, reason) => this.processPool.kill(moduleId, reason),
       getSpawnTimestamp: (moduleId) => this.processPool.getSpawnTimestamp(moduleId),
-    });
+    }, _events);
   }
 
   // ─── Public API (delegates to sub-systems) ────────────────────

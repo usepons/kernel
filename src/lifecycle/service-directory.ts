@@ -1,14 +1,25 @@
 /**
- * Service Directory — module activation, dependency resolution, lifecycle events.
+ * ServiceDirectory — the gatekeeper that decides when a module is truly alive.
  *
- * Owns: pendingReady, readyTimers state.
- * Handles the 'ready' message flow: capability registration, topic subscription,
- * service registration, dependency checking, and activation.
+ * A module process existing and sending `ready` is necessary but not sufficient.
+ * Before a module can receive messages or serve RPC calls, it must prove that its
+ * dependencies are satisfied. The ServiceDirectory holds modules in a `pendingReady`
+ * state until all their `requires` services have been registered by other modules.
+ * Only then does it activate the module and send `deps_ready`.
+ *
+ * This is the mechanism that gives the kernel its startup ordering guarantee: you can
+ * declare `requires: ["llm"]` in your manifest and know that `onDepsReady()` will only
+ * fire after the LLM module is fully initialized — without any manual sleep() or polling.
+ *
+ * The ServiceDirectory also registers capabilities with the SecurityEnforcer, subscribes
+ * modules to their declared bus topics, and emits lifecycle events (module:ready,
+ * module:stopped, etc.) that the rest of the system can react to.
  */
 
 import type { ModuleManifest } from '@pons/sdk';
 import type { ModuleCapabilities } from '../security/enforcer.ts';
 import type { LifecycleContext, PendingReady } from './types.ts';
+import type { TypedEmitter } from './typed-emitter.ts';
 
 // ─── Callback Interfaces ──────────────────────────────────────
 
@@ -34,7 +45,13 @@ export class ServiceDirectory {
   constructor(
     private readonly ctx: LifecycleContext,
     private readonly callbacks: ServiceDirectoryCallbacks,
-  ) {}
+    events: TypedEmitter,
+  ) {
+    events.on("module:timers:clear", (moduleId) => {
+      this.clearPendingReady(moduleId);
+      this.clearReadyTimeout(moduleId);
+    });
+  }
 
   // ─── Ready Handler ────────────────────────────────────────────
 
@@ -158,6 +175,15 @@ export class ServiceDirectory {
     this.ctx.registry.setStatus(moduleId, 'ready');
     this.callbacks.startHealthCheck(moduleId);
     this.callbacks.send(moduleId, { type: 'deps_ready' });
+
+    // Notify module of any optional services that are already available
+    const activatedEntry = this.ctx.registry.get(moduleId);
+    const optional = ((activatedEntry?.manifest as unknown as { optionalRequires?: string[] })?.optionalRequires) ?? [];
+    for (const svc of optional) {
+      if (this.ctx.registry.resolveService(svc)) {
+        this.callbacks.send(moduleId, { type: 'service_available', service: svc });
+      }
+    }
     const readyEntry = this.ctx.registry.get(moduleId);
     this.publishLifecycleEvent('system:module:ready', {
       moduleId,

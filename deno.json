@@ -4,6 +4,7 @@
   "license": "MIT",
 
   "imports": {
+    "@std/path": "jsr:@std/path@^1",
     "@pons/sdk": "../sdk/src/index.ts",
     "@pons/sdk/config": "../sdk/src/config.ts",
     "ajv": "npm:ajv@^8",
@@ -21,11 +22,18 @@
   "tasks": {
     "dev": "deno run --allow-all --unstable-worker-options --watch src/index.ts",
     "start": "deno run --allow-all src/index.ts",
+    "test": "deno test --allow-all tests/",
+    "test:unit": "deno test --allow-all tests/unit/",
+    "test:integration": "deno test --allow-all tests/integration/",
     "bench": "deno run --allow-all benchmarks/run-all.ts",
     "bench:boot": "deno run --allow-all benchmarks/boot-time.ts",
     "bench:memory": "deno run --allow-all benchmarks/memory.ts",
     "bench:shutdown": "deno run --allow-all benchmarks/shutdown-time.ts",
     "bench:spawn": "deno run --allow-all benchmarks/module-spawn.ts",
-    "bench:scale": "deno run --allow-all benchmarks/scale.ts"
+    "bench:ipc": "deno run --allow-all benchmarks/ipc-latency.ts",
+    "bench:rpc": "deno run --allow-all benchmarks/rpc-latency.ts",
+    "bench:restart": "deno run --allow-all benchmarks/module-restart.ts",
+    "bench:scale": "deno run --allow-all benchmarks/scale.ts",
+    "test": "deno test --allow-all tests/"
   }
 }

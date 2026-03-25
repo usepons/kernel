@@ -1,6 +1,15 @@
 /**
- * Module Registry — tracks all known modules, their process handles,
- * and the service directory (which module provides which service).
+ * Module Registry — the kernel's source of truth about what modules exist and what state they're in.
+ *
+ * Every module that the kernel knows about has an entry here from the moment it's discovered
+ * on disk until the kernel shuts down. The registry is deliberately dumb: it stores data and
+ * answers questions, but never makes decisions. All the logic about when to spawn, kill, or
+ * restart lives in ProcessPool — the registry just keeps score.
+ *
+ * It also doubles as a service directory: when module A declares that it `provides: ["llm"]`
+ * and module B declares that it `requires: ["llm"]`, the registry is what connects them.
+ * Service names are strings by convention, not enforced types — this is intentional flexibility
+ * at the cost of a runtime error if a name is misspelled.
  */
 
 import type { ModuleManifest } from '@pons/sdk';
@@ -8,7 +17,7 @@ import type { ModuleManifest } from '@pons/sdk';
 export type ModuleStatus = 'starting' | 'waiting' | 'ready' | 'killed' | 'restarting' | 'stopped' | 'crashed';
 
 /** Minimal interface shared by DenoChildProcessWrapper and any test doubles. */
-export interface ChildProcessLike {
+export interface ModuleProcess {
   readonly pid: number;
   connected: boolean;
   send(msg: unknown): void;
@@ -21,7 +30,7 @@ export interface ChildProcessLike {
 export interface ModuleEntry {
   manifest: ModuleManifest;
   runnerPath: string | null;
-  process: ChildProcessLike | null;
+  process: ModuleProcess | null;
   status: ModuleStatus;
   pid: number | undefined;
   restartCount: number;
@@ -49,7 +58,7 @@ export class ModuleRegistry {
     });
   }
 
-  setProcess(id: string, proc: ChildProcessLike): void {
+  setProcess(id: string, proc: ModuleProcess): void {
     const entry = this.modules.get(id);
     if (!entry) return;
     entry.process = proc;

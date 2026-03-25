@@ -8,6 +8,7 @@ import { isSubset } from "./security/permissions.ts";
 import type { PermissionStore } from "./security/permissions.ts";
 import type { SecurityEnforcer } from "./security/enforcer.ts";
 import { PERMISSION_FIELDS } from "./security/constants.ts";
+import type { MessageBus } from "./messaging/bus.ts";
 
 export class ModuleCallHandler {
   constructor(
@@ -16,6 +17,7 @@ export class ModuleCallHandler {
     private readonly permissionStore: PermissionStore,
     private readonly lifecycle: LifecycleManager,
     private readonly logger: KernelLogger,
+    private readonly bus?: MessageBus,
   ) {}
 
   async handle(moduleId: string, method: string, params: unknown): Promise<unknown> {
@@ -156,6 +158,9 @@ export class ModuleCallHandler {
 
     this.logger.warn({ module: moduleId, requestId: pending.id }, 'Pending permission request');
 
+    // Publish on the bus so any operator module (telegram, web, etc.) can show UI
+    this.publishPermissionRequest(moduleId, pending.id, permissions, reason);
+
     return { granted: false, pending: true, requestId: pending.id };
   }
 
@@ -186,8 +191,8 @@ export class ModuleCallHandler {
     return this.permissionStore.getPendingRequests();
   }
 
-  /** Only operator modules (e.g. the gateway) may grant or deny permissions. */
-  private static readonly OPERATOR_MODULES = new Set(['gateway']);
+  /** Only operator modules (e.g. the gateway, telegram) may grant or deny permissions. */
+  private static readonly OPERATOR_MODULES = new Set(['gateway', 'telegram']);
 
   private assertOperator(callerId: string): void {
     if (!ModuleCallHandler.OPERATOR_MODULES.has(callerId)) {
@@ -206,6 +211,29 @@ export class ModuleCallHandler {
     try { Deno.kill(Deno.pid, 'SIGUSR2'); } catch { /* best-effort */ }
     this.logger.info({ operator: callerId, target: moduleId, requestId }, 'permission.granted');
     return { success: true };
+  }
+
+  private publishPermissionRequest(
+    moduleId: string,
+    requestId: string,
+    permissions: unknown,
+    reason?: string,
+  ): void {
+    if (!this.bus) return;
+    const topic = 'kernel.permissions.pending';
+    const subscribers = this.bus.getSubscribers(topic);
+    if (subscribers.length === 0) return;
+
+    for (const subscriberId of subscribers) {
+      const entry = this.lifecycle.getRegistry().get(subscriberId);
+      if (!entry?.process?.connected || entry.status !== 'ready') continue;
+      this.lifecycle.sendMessage(subscriberId, {
+        type: 'deliver' as const,
+        id: crypto.randomUUID(),
+        topic,
+        payload: { moduleId, requestId, permissions, reason },
+      });
+    }
   }
 
   private handlePermissionsDeny(callerId: string, params: unknown): { success: boolean } {
