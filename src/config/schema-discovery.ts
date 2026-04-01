@@ -4,7 +4,7 @@ import { join, toFileUrl } from "jsr:@std/path@^1";
 import { z } from "npm:zod@^3.24";
 import type { ZodObject, ZodRawShape } from "npm:zod@^3.24";
 // deno-lint-ignore-file no-explicit-any
-import AjvDefault, { type ValidateFunction } from "npm:ajv@^8";
+import Ajv2020Default, { type ValidateFunction } from "npm:ajv@^8/dist/2020.js";
 import addFormatsDefault from "npm:ajv-formats@^3";
 import type { ModuleManifest } from "@pons/sdk";
 import type { ConfigSchemaDefinition } from "@pons/sdk/config";
@@ -22,7 +22,7 @@ const FORBIDDEN_PATTERNS = [
 ];
 
 // CJS interop: ajv exports { default: class Ajv } in Deno
-const Ajv = (AjvDefault as any).default ?? AjvDefault;
+const Ajv = (Ajv2020Default as any).default ?? Ajv2020Default;
 const addFormats = (addFormatsDefault as any).default ?? addFormatsDefault;
 const ajv = new Ajv({ useDefaults: true, allErrors: true, coerceTypes: true });
 addFormats(ajv);

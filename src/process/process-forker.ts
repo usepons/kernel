@@ -17,7 +17,6 @@ const SYSTEM_ENV_KEYS = [
 
 export class ProcessForker {
   private denoConfigPath: string | null;
-  private _denoSandboxAvailable: boolean | null = null;
   private _gvisorAvailable: boolean | null = null;
 
   constructor(
@@ -66,11 +65,6 @@ export class ProcessForker {
 
     switch (runtime) {
       case 'deno': {
-        const sandboxAvailable = this.isDenoSandboxAvailable();
-        if (sandboxAvailable) {
-          return this.buildDenoSandboxArgs(runnerPath, manifest);
-        }
-        this.logger.warn({ module: manifest.id }, 'Deno Sandbox not available — falling back to permission flags');
         const effective = this.permissionStore?.getEffectivePermissions(manifest.id);
         const approvedRun = effective?.run ?? [];
         const denoPerms = effective
@@ -153,29 +147,6 @@ export class ProcessForker {
     }
   }
 
-  private buildDenoSandboxArgs(
-    runnerPath: string,
-    manifest: ModuleManifest,
-  ): { executable: string; args: string[] } {
-    const effective = this.permissionStore?.getEffectivePermissions(manifest.id);
-    const moduleDir = dirname(runnerPath);
-    const approvedRun = effective?.run ?? [];
-    const denoPerms = effective
-      ? translateToDenoFlags(effective, moduleDir, approvedRun)
-      : ['--deny-all'];
-
-    return {
-      executable: Deno.execPath(),
-      args: [
-        'run',
-        '--sandbox',
-        ...denoPerms,
-        '--unstable-sloppy-imports',
-        runnerPath,
-      ],
-    };
-  }
-
   private buildGVisorArgs(
     executable: string,
     args: string[],
@@ -208,23 +179,6 @@ export class ProcessForker {
         ...args,
       ],
     };
-  }
-
-  private isDenoSandboxAvailable(): boolean {
-    if (this._denoSandboxAvailable !== null) return this._denoSandboxAvailable;
-    try {
-      const result = new Deno.Command(Deno.execPath(), {
-        args: ['--version'],
-        stdout: 'piped',
-        stderr: 'null',
-      }).outputSync();
-      const version = new TextDecoder().decode(result.stdout);
-      const match = version.match(/deno (\d+)\./);
-      this._denoSandboxAvailable = match ? parseInt(match[1]) >= 2 : false;
-    } catch {
-      this._denoSandboxAvailable = false;
-    }
-    return this._denoSandboxAvailable;
   }
 
   private isGVisorAvailable(): boolean {
