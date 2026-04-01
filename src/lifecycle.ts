@@ -40,6 +40,7 @@ export class LifecycleManager {
     private readonly onModuleCall: (moduleId: string, method: string, params: unknown) => Promise<unknown>,
     private readonly enforcer?: SecurityEnforcer,
     private readonly permissionStore?: PermissionStore,
+    private readonly promptPermission?: (request: { moduleId: string; type: 'topic' | 'service'; value: string }) => Promise<'grant-session' | 'grant-always' | 'deny'>,
   ) {
     const limits = loadLimits(initPayload);
     this.ctx = { registry: this.registry, logger, bus, enforcer, permissionStore, limits };
@@ -57,6 +58,7 @@ export class LifecycleManager {
       onReady: (moduleId) => this.serviceDirectory.onReady(moduleId),
       onModuleCall: (moduleId, method, params) => this.onModuleCall(moduleId, method, params),
       kill: (moduleId, reason) => this.processPool.kill(moduleId, reason),
+      promptPermission: this.promptPermission ?? (async () => 'deny' as const),
     }, _events);
 
     this.processPool = new ProcessPool(this.ctx, initPayload, {

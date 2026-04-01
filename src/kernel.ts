@@ -16,6 +16,7 @@ import type { DiscoveredModule } from "./module/loader.ts";
 import type { KernelConfig, LogLevel } from "./config/types.ts";
 import { PermissionStore } from "./security/permissions.ts";
 import { SecurityEnforcer } from "./security/enforcer.ts";
+import { PermissionPrompter } from './security/prompter.ts';
 import { ModuleCallHandler } from "./module-call-handler.ts";
 import {
   createConfigReloadHandler,
@@ -37,6 +38,7 @@ export default class Kernel {
   private lifecycle: LifecycleManager;
   private permissionStore: PermissionStore;
   private enforcer: SecurityEnforcer;
+  private prompter!: PermissionPrompter;
   private moduleCallHandler!: ModuleCallHandler;
   private controlServer?: ControlServer;
 
@@ -109,10 +111,15 @@ export default class Kernel {
       this.logger,
       this.bus,
       { config, workspacePath: getPonsHome(), projectRoot: getPonsHome() },
-      (moduleId, method, params) =>
-        this.moduleCallHandler.handle(moduleId, method, params),
+      (moduleId, method, params) => {
+        if (!this.moduleCallHandler) {
+          throw new Error('Kernel not fully initialized — module call received too early');
+        }
+        return this.moduleCallHandler.handle(moduleId, method, params);
+      },
       this.enforcer,
       this.permissionStore,
+      (request) => this.prompter.prompt(request),
     );
 
     // ModuleCallHandler and LifecycleManager have a circular dependency: lifecycle
@@ -126,6 +133,7 @@ export default class Kernel {
       this.lifecycle,
       this.logger,
       this.bus,
+      this._bootTime,
     );
 
     // Patch the runtime's lifecycle reference — ugly but honest: we can't pass it
@@ -141,7 +149,7 @@ export default class Kernel {
    * Start phase — spawn discovered modules, register shutdown handlers.
    */
   async start(): Promise<this> {
-    this.lifecycle.spawnAll(this.modules);
+    await this.lifecycle.spawnAll(this.modules);
 
     this.runtime.addSignalHandler("SIGINT", () => {
       this.runtime.shutdown().catch(console.error);

@@ -159,6 +159,10 @@ export class ModuleLoader {
       return null;
     }
 
-    return { manifest, runnerPath, moduleDir };
+    const result: DiscoveredModule & { unsandboxed?: boolean } = { manifest, runnerPath, moduleDir };
+    if (manifest.runtime && manifest.runtime !== 'deno') {
+      result.unsandboxed = true;
+    }
+    return result;
   }
 }

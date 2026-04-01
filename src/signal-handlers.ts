@@ -98,43 +98,50 @@ export function createConfigReloadHandler(deps: ConfigReloadDeps): () => void {
 
 export function createPermissionReloadHandler(deps: PermissionReloadDeps): () => void {
   const { permissionStore, lifecycle, logger, isShuttingDown } = deps;
+  let debounceTimer: ReturnType<typeof setTimeout> | null = null;
 
   return function handlePermissionReload(): void {
     if (isShuttingDown()) return;
-    logger.info("Received SIGUSR2 — reloading permissions");
-    try {
-      // PONS-006: Snapshot effective permissions before reload
-      const before = new Map<string, string>();
-      for (const moduleId of lifecycle.getRegistry().ids()) {
-        const entry = lifecycle.getRegistry().get(moduleId);
-        if (!entry || entry.status === "stopped" || entry.status === "crashed") continue;
-        const eff = permissionStore.getEffectivePermissions(moduleId);
-        before.set(moduleId, JSON.stringify(eff));
-      }
+    if (debounceTimer) return; // Already scheduled
 
-      permissionStore.reload();
-      // Refresh enforcer capabilities so updated caps take effect immediately
-      lifecycle.refreshCapabilities();
+    debounceTimer = setTimeout(() => {
+      debounceTimer = null;
+      if (isShuttingDown()) return;
+      logger.info("Received SIGUSR2 — reloading permissions");
+      try {
+        // PONS-006: Snapshot effective permissions before reload
+        const before = new Map<string, string>();
+        for (const moduleId of lifecycle.getRegistry().ids()) {
+          const entry = lifecycle.getRegistry().get(moduleId);
+          if (!entry || entry.status === "stopped" || entry.status === "crashed") continue;
+          const eff = permissionStore.getEffectivePermissions(moduleId);
+          before.set(moduleId, JSON.stringify(eff));
+        }
 
-      // Compare and act on changes
-      for (const moduleId of lifecycle.getRegistry().ids()) {
-        const entry = lifecycle.getRegistry().get(moduleId);
-        if (!entry || entry.status === "stopped" || entry.status === "crashed") continue;
+        permissionStore.reload();
+        // Refresh enforcer capabilities so updated caps take effect immediately
+        lifecycle.refreshCapabilities();
 
-        if (!permissionStore.isApproved(moduleId)) {
-          logger.warn({ module: moduleId }, "Permissions fully revoked — killing module");
-          lifecycle.kill(moduleId, "permissions-revoked");
-        } else {
-          const after = JSON.stringify(permissionStore.getEffectivePermissions(moduleId));
-          if (before.get(moduleId) !== after) {
-            logger.info({ module: moduleId }, "Permissions changed — restarting with updated flags");
-            lifecycle.restartWithUpdatedPermissions(moduleId);
+        // Compare and act on changes
+        for (const moduleId of lifecycle.getRegistry().ids()) {
+          const entry = lifecycle.getRegistry().get(moduleId);
+          if (!entry || entry.status === "stopped" || entry.status === "crashed") continue;
+
+          if (!permissionStore.isApproved(moduleId)) {
+            logger.warn({ module: moduleId }, "Permissions fully revoked — killing module");
+            lifecycle.kill(moduleId, "permissions-revoked");
+          } else {
+            const after = JSON.stringify(permissionStore.getEffectivePermissions(moduleId));
+            if (before.get(moduleId) !== after) {
+              logger.info({ module: moduleId }, "Permissions changed — restarting with updated flags");
+              lifecycle.restartWithUpdatedPermissions(moduleId);
+            }
           }
         }
+      } catch (err) {
+        logger.error({ error: String(err) }, "Failed to reload permissions");
       }
-    } catch (err) {
-      logger.error({ error: String(err) }, "Failed to reload permissions");
-    }
+    }, 100);
   };
 }
 

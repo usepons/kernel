@@ -114,6 +114,10 @@ export class ProcessPool {
 
     this.ctx.registry.setProcess(manifest.id, proc);
     this.spawnTimestamps.set(manifest.id, Date.now());
+    if (manifest.runtime && manifest.runtime !== 'deno') {
+      this.ctx.logger.warn({ moduleId: manifest.id, runtime: manifest.runtime },
+        'Module uses non-Deno runtime — OS-level sandbox does NOT apply. Permissions block is advisory only.');
+    }
     this.ctx.logger.info({ moduleId: manifest.id, pid: proc.pid, runtime: (manifest as ModuleManifest & { runtime?: string }).runtime ?? 'deno' }, 'module.spawn');
 
     // First-time spawn: send install message before init
@@ -367,7 +371,7 @@ export class ProcessPool {
 
   private async withModuleLock(moduleId: string, fn: () => Promise<void>): Promise<void> {
     const prev = this.restartLocks.get(moduleId) ?? Promise.resolve();
-    const next = prev.catch(() => {}).then(fn);
+    const next = prev.catch((err) => { this.ctx.logger.error({ moduleId, error: String(err) }, 'Module lock chain error'); }).then(fn);
     this.restartLocks.set(moduleId, next);
     try {
       await next;

@@ -132,6 +132,28 @@ export class PermissionStore {
     this.save();
   }
 
+  /** Derive IPC capabilities from manifest fields for use at install time. */
+  deriveCapabilitiesFromManifest(manifest: {
+    subscribes?: string[];
+    publishes?: string[];
+    requires?: string[];
+    optionalRequires?: string[];
+    capabilities?: { topics?: string[]; services?: string[] };
+  }): StoredCapabilities {
+    return {
+      topics: [...new Set([
+        ...(manifest.subscribes ?? []),
+        ...(manifest.publishes ?? []),
+        ...(manifest.capabilities?.topics ?? []),
+      ])],
+      services: [...new Set([
+        ...(manifest.requires ?? []),
+        ...(manifest.optionalRequires ?? []),
+        ...(manifest.capabilities?.services ?? []),
+      ])],
+    };
+  }
+
   /** PONS-004: Store IPC capabilities at approval time so they are kernel-controlled. */
   approveCapabilities(moduleId: string, capabilities: StoredCapabilities): void {
     if (!this.data[moduleId]) return;

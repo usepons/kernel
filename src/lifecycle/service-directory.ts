@@ -101,19 +101,10 @@ export class ServiceDirectory {
         for (const topic of topics) {
           const violation = this.ctx.enforcer.checkTopic(moduleId, topic, 'subscribe', caps);
           if (violation) {
-            // Fallback: auto-derive from manifest before enforcing
-            const manifestTopics = [...(manifest.subscribes ?? []), ...(manifest.publishes ?? [])];
-            if (manifestTopics.includes(topic)) {
-              this.ctx.logger.warn({ moduleId, topic }, `Topic '${topic}' not in capabilities but found in manifest — auto-allowing. Add to capabilities block to silence this warning.`);
-              const updatedTopics = [...new Set([...(caps.topics ?? []), topic])];
-              this.ctx.enforcer.setModuleCapabilities(moduleId, { ...caps, topics: updatedTopics });
-            } else {
-              this.ctx.enforcer.logViolation(violation);
-              if (violation.action === 'deny') {
-                this.callbacks.kill(moduleId, 'security-violation');
-                return;
-              }
-              // warn mode: log but continue
+            this.ctx.enforcer.logViolation(violation);
+            if (violation.action === 'deny') {
+              this.callbacks.kill(moduleId, 'security-violation');
+              return;
             }
           }
         }
@@ -277,7 +268,7 @@ export class ServiceDirectory {
       const entry = this.ctx.registry.get(moduleId);
       if (!entry || entry.status !== 'starting') return;
       this.ctx.logger.error({ module: moduleId }, `Module did not send 'ready' within ${this.ctx.limits.readyTimeoutMs / 1000}s — treating as crash`);
-      entry.process?.kill('SIGKILL');
+      this.callbacks.kill(moduleId, 'ready-timeout');
     }, this.ctx.limits.readyTimeoutMs);
     this.readyTimers.set(moduleId, timer);
   }

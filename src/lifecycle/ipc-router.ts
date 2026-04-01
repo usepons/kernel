@@ -31,6 +31,8 @@ export interface IpcRouterCallbacks {
   onModuleCall(moduleId: string, method: string, params: unknown): Promise<unknown>;
   /** Called when a module should be killed (security violation, etc.). */
   kill(moduleId: string, reason: string): void;
+  /** Called when a module attempts an undeclared capability. Pause and ask the operator. */
+  promptPermission: (request: { moduleId: string; type: 'topic' | 'service'; value: string }) => Promise<'grant-session' | 'grant-always' | 'deny'>;
 }
 
 // ─── IPC Router ───────────────────────────────────────────────
@@ -70,7 +72,13 @@ export class IpcRouter {
 
   // ─── Publish (Pub/Sub) ────────────────────────────────────────
 
-  private onPublish(fromModuleId: string, topic: string, payload: unknown): void {
+  private async onPublish(fromModuleId: string, topic: string, payload: unknown): Promise<void> {
+    const entry = this.ctx.registry.get(fromModuleId);
+    if (!entry || entry.status !== 'ready') {
+      this.ctx.logger.warn({ moduleId: fromModuleId }, 'Rejected message from module not in ready state');
+      return;
+    }
+
     if (this.ctx.enforcer) {
       const capabilities = this.ctx.enforcer.getModuleCapabilities(fromModuleId);
       if (!capabilities) {
@@ -78,28 +86,25 @@ export class IpcRouter {
         if (violation) {
           this.ctx.enforcer.logViolation(violation);
           if (violation.action === 'deny') {
-            this.callbacks.kill(fromModuleId, 'security-violation');
-            return;
+            const decision = await this.callbacks.promptPermission({
+              moduleId: fromModuleId, type: 'topic', value: topic,
+            });
+            if (decision === 'deny') {
+              this.ctx.logger.warn({ moduleId: fromModuleId, topic }, 'Topic publish denied by operator');
+              return; // drop message, don't kill
+            }
+            // Granted — bootstrap capabilities for this module
+            this.ctx.enforcer.setModuleCapabilities(fromModuleId, { topics: [topic], services: [] });
           }
           // warn mode: log but continue
         }
       }
       const violation = capabilities ? this.ctx.enforcer.checkTopic(fromModuleId, topic, 'publish', capabilities) : null;
       if (violation) {
-        // Fallback: auto-derive from manifest before enforcing
-        const manifest = this.ctx.registry.get(fromModuleId)?.manifest;
-        const manifestTopics = [...(manifest?.subscribes ?? []), ...(manifest?.publishes ?? [])];
-        if (manifest && manifestTopics.includes(topic)) {
-          this.ctx.logger.warn({ moduleId: fromModuleId, topic }, `Topic '${topic}' not in capabilities but found in manifest — auto-allowing. Add to capabilities block to silence this warning.`);
-          const updatedTopics = [...new Set([...(capabilities?.topics ?? []), topic])];
-          this.ctx.enforcer.setModuleCapabilities(fromModuleId, { ...capabilities, topics: updatedTopics });
-        } else {
-          this.ctx.enforcer.logViolation(violation);
-          if (violation.action === 'deny') {
-            this.callbacks.kill(fromModuleId, 'security-violation');
-            return;
-          }
-          // warn mode: log but continue
+        this.ctx.enforcer.logViolation(violation);
+        if (violation.action === 'deny') {
+          this.callbacks.kill(fromModuleId, 'security-violation');
+          return;
         }
       }
     }
@@ -154,7 +159,14 @@ export class IpcRouter {
 
   // ─── RPC Routing ──────────────────────────────────────────────
 
-  private onRpcRequest(callerModuleId: string, rpcId: string, service: string, method: string, params?: unknown): void {
+  private async onRpcRequest(callerModuleId: string, rpcId: string, service: string, method: string, params?: unknown): Promise<void> {
+    const entry = this.ctx.registry.get(callerModuleId);
+    if (!entry || entry.status !== 'ready') {
+      this.ctx.logger.warn({ moduleId: callerModuleId }, 'Rejected RPC from module not in ready state');
+      this.send(callerModuleId, { type: 'rpc_response', id: rpcId, error: 'Module not ready' });
+      return;
+    }
+
     if (this.ctx.enforcer) {
       const capabilities = this.ctx.enforcer.getModuleCapabilities(callerModuleId);
       if (!capabilities) {
@@ -162,30 +174,27 @@ export class IpcRouter {
         if (violation) {
           this.ctx.enforcer.logViolation(violation);
           if (violation.action === 'deny') {
-            this.send(callerModuleId, { type: 'rpc_response', id: rpcId, error: 'forbidden' });
-            this.callbacks.kill(callerModuleId, 'security-violation');
-            return;
+            const decision = await this.callbacks.promptPermission({
+              moduleId: callerModuleId, type: 'service', value: service,
+            });
+            if (decision === 'deny') {
+              this.ctx.logger.warn({ moduleId: callerModuleId, service }, 'RPC request denied by operator');
+              this.send(callerModuleId, { type: 'rpc_response', id: rpcId, error: 'forbidden' });
+              return; // drop request, don't kill
+            }
+            // Granted — bootstrap capabilities for this module
+            this.ctx.enforcer.setModuleCapabilities(callerModuleId, { topics: [], services: [service] });
           }
           // warn mode: log but continue
         }
       }
       const violation = capabilities ? this.ctx.enforcer.checkRpc(callerModuleId, service, capabilities) : null;
       if (violation) {
-        // Fallback: auto-derive from manifest before enforcing
-        const manifest = this.ctx.registry.get(callerModuleId)?.manifest;
-        const manifestServices = [...(manifest?.requires ?? []), ...(manifest?.optionalRequires ?? [])];
-        if (manifest && manifestServices.includes(service)) {
-          this.ctx.logger.warn({ moduleId: callerModuleId, service }, `Service '${service}' not in capabilities but found in manifest — auto-allowing. Add to capabilities block to silence this warning.`);
-          const updatedServices = [...new Set([...(capabilities?.services ?? []), service])];
-          this.ctx.enforcer.setModuleCapabilities(callerModuleId, { ...capabilities, services: updatedServices });
-        } else {
-          this.ctx.enforcer.logViolation(violation);
-          if (violation.action === 'deny') {
-            this.send(callerModuleId, { type: 'rpc_response', id: rpcId, error: 'forbidden' });
-            this.callbacks.kill(callerModuleId, 'security-violation');
-            return;
-          }
-          // warn mode: log but continue
+        this.ctx.enforcer.logViolation(violation);
+        if (violation.action === 'deny') {
+          this.send(callerModuleId, { type: 'rpc_response', id: rpcId, error: 'forbidden' });
+          this.callbacks.kill(callerModuleId, 'security-violation');
+          return;
         }
       }
     }
@@ -207,6 +216,15 @@ export class IpcRouter {
       this.ctx.logger.warn({ callerId: callerModuleId, targetService: service, method, timeoutMs: this.ctx.limits.rpcTimeoutMs }, 'rpc.timeout');
       this.send(callerModuleId, { type: 'rpc_response', id: rpcId, error: 'timeout' });
     }, this.ctx.limits.rpcTimeoutMs);
+
+    // Publish RPC event for monitoring
+    const rpcEvent = { from: callerModuleId, service, method, id: rpcId, ts: Date.now() };
+    for (const subscriberId of this.ctx.bus.getSubscribers('system:rpc')) {
+      const subEntry = this.ctx.registry.get(subscriberId);
+      if (subEntry?.process?.connected && subEntry.status === 'ready') {
+        this.send(subscriberId, { type: 'deliver', id: crypto.randomUUID(), topic: 'system:rpc', payload: rpcEvent });
+      }
+    }
 
     this.pendingRpc.set(rpcId, { callerModuleId, targetModuleId, timer });
     this.send(targetModuleId, {

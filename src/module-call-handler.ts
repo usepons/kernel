@@ -11,6 +11,8 @@ import { PERMISSION_FIELDS } from "./security/constants.ts";
 import type { MessageBus } from "./messaging/bus.ts";
 
 export class ModuleCallHandler {
+  private readonly _bootTime: number;
+
   constructor(
     private readonly configManager: ConfigManager,
     private readonly enforcer: SecurityEnforcer,
@@ -18,7 +20,10 @@ export class ModuleCallHandler {
     private readonly lifecycle: LifecycleManager,
     private readonly logger: KernelLogger,
     private readonly bus?: MessageBus,
-  ) {}
+    bootTime?: number,
+  ) {
+    this._bootTime = bootTime ?? Date.now();
+  }
 
   async handle(moduleId: string, method: string, params: unknown): Promise<unknown> {
     // Security: get the calling module's manifest for config scoping
@@ -46,10 +51,13 @@ export class ModuleCallHandler {
         return this.handlePermissionsCheck(moduleId, params);
       case "permissions.pending":
         return this.handlePermissionsPending();
-      case "permissions.grant":
-        return this.handlePermissionsGrant(moduleId, params);
-      case "permissions.deny":
-        return this.handlePermissionsDeny(moduleId, params);
+      case "monitor.snapshot":
+        return {
+          modules: this.lifecycle.getRegistry().allPublic(),
+          services: this.lifecycle.getRegistry().listServices(),
+          pending: this.permissionStore.getPendingRequests(),
+          uptime: Date.now() - this._bootTime,
+        };
       default:
         throw new Error(`Unknown kernel method: ${method}`);
     }
@@ -80,6 +88,15 @@ export class ModuleCallHandler {
     callerConfigKey: string | undefined,
   ): unknown {
     const { key, value } = params as { key: string; value: unknown };
+
+    // Protected sections — only kernel can modify these
+    const PROTECTED_SECTIONS = new Set(['security', 'kernel']);
+    const section = key.split('.')[0];
+    if (PROTECTED_SECTIONS.has(section)) {
+      this.lifecycle.kill(moduleId, 'security-violation');
+      throw new Error(`Security violation: section "${section}" is protected and cannot be modified by modules`);
+    }
+
     // Security: enforce config scope -- module can only write its own section
     const violation = this.enforcer.checkConfig(moduleId, key, callerConfigKey);
     if (violation) {
@@ -156,6 +173,9 @@ export class ModuleCallHandler {
     // Send system notification (best-effort)
     sendSystemNotification(moduleId);
 
+    // Notify UI via gateway (best-effort)
+    this.notifyUiPermissionRequest(moduleId, pending.id, permissions, reason);
+
     this.logger.warn({ module: moduleId, requestId: pending.id }, 'Pending permission request');
 
     // Publish on the bus so any operator module (telegram, web, etc.) can show UI
@@ -191,28 +211,6 @@ export class ModuleCallHandler {
     return this.permissionStore.getPendingRequests();
   }
 
-  /** Only operator modules (e.g. the gateway, telegram) may grant or deny permissions. */
-  private static readonly OPERATOR_MODULES = new Set(['gateway', 'telegram']);
-
-  private assertOperator(callerId: string): void {
-    if (!ModuleCallHandler.OPERATOR_MODULES.has(callerId)) {
-      this.logger.error({ moduleId: callerId }, 'Unauthorized permissions.grant/deny attempt');
-      throw new Error('Only operator modules may grant or deny permissions');
-    }
-  }
-
-  private handlePermissionsGrant(callerId: string, params: unknown): { success: boolean } {
-    this.assertOperator(callerId);
-    const { moduleId, requestId } = params as { moduleId: string; requestId: string };
-    if (!moduleId || !requestId) throw new Error('moduleId and requestId are required');
-    const resolved = this.permissionStore.resolvePending(moduleId, requestId, 'grant');
-    if (!resolved) throw new Error(`Pending request not found: ${requestId}`);
-    // Trigger permission reload — the kernel's SIGUSR2 handler will restart the module
-    try { Deno.kill(Deno.pid, 'SIGUSR2'); } catch { /* best-effort */ }
-    this.logger.info({ operator: callerId, target: moduleId, requestId }, 'permission.granted');
-    return { success: true };
-  }
-
   private publishPermissionRequest(
     moduleId: string,
     requestId: string,
@@ -236,18 +234,40 @@ export class ModuleCallHandler {
     }
   }
 
-  private handlePermissionsDeny(callerId: string, params: unknown): { success: boolean } {
-    this.assertOperator(callerId);
-    const { moduleId, requestId } = params as { moduleId: string; requestId: string };
-    if (!moduleId || !requestId) throw new Error('moduleId and requestId are required');
-    const resolved = this.permissionStore.resolvePending(moduleId, requestId, 'deny');
-    if (!resolved) throw new Error(`Pending request not found: ${requestId}`);
-    this.logger.info({ operator: callerId, target: moduleId, requestId }, 'permission.denied');
-    return { success: true };
+  /** Push a permission request event to the gateway so the web UI can show it. */
+  private notifyUiPermissionRequest(
+    moduleId: string,
+    requestId: string,
+    permissions: Partial<ModulePermissions>,
+    reason?: string,
+  ): void {
+    try {
+      const gatewayEntry = this.lifecycle.getRegistry().get('gateway');
+      if (!gatewayEntry?.process?.connected) return;
+      this.lifecycle.sendMessage('gateway', {
+        type: 'deliver',
+        id: crypto.randomUUID(),
+        topic: 'outbound:ws',
+        payload: {
+          type: 'permission:request',
+          moduleId,
+          requestId,
+          permissions,
+          reason,
+        },
+      });
+    } catch { /* best-effort */ }
   }
 }
 
+const notificationCooldowns = new Map<string, number>();
+const NOTIFICATION_COOLDOWN_MS = 60_000;
+
 export function sendSystemNotification(moduleId: string): void {
+  const now = Date.now();
+  const last = notificationCooldowns.get(moduleId) ?? 0;
+  if (now - last < NOTIFICATION_COOLDOWN_MS) return;
+  notificationCooldowns.set(moduleId, now);
   try {
     // Sanitize moduleId -- strip anything that could escape shell/AppleScript strings
     const safeId = moduleId.replace(/[^a-zA-Z0-9_\-\.]/g, '');

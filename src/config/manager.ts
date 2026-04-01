@@ -181,7 +181,9 @@ export class ConfigManager {
    */
   save(): void {
     const yaml = stringifyYaml(this.configData, { lineWidth: 120 });
-    Deno.writeTextFileSync(this.configPath, yaml, { mode: 0o600 });
+    const tmpPath = this.configPath + '.tmp';
+    Deno.writeTextFileSync(tmpPath, yaml, { mode: 0o600 });
+    Deno.renameSync(tmpPath, this.configPath);
   }
 
   // ─── CRUD ──────────────────────────────────────────────────
