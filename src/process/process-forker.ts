@@ -17,6 +17,8 @@ const SYSTEM_ENV_KEYS = [
 
 export class ProcessForker {
   private denoConfigPath: string | null;
+  private _denoSandboxAvailable: boolean | null = null;
+  private _gvisorAvailable: boolean | null = null;
 
   constructor(
     private readonly logger: KernelLogger,
@@ -64,8 +66,12 @@ export class ProcessForker {
 
     switch (runtime) {
       case 'deno': {
+        const sandboxAvailable = this.isDenoSandboxAvailable();
+        if (sandboxAvailable) {
+          return this.buildDenoSandboxArgs(runnerPath, manifest);
+        }
+        this.logger.warn({ module: manifest.id }, 'Deno Sandbox not available — falling back to permission flags');
         const effective = this.permissionStore?.getEffectivePermissions(manifest.id);
-        // Dangerous binaries (sh, bash, etc.) are allowed if explicitly approved in permission store
         const approvedRun = effective?.run ?? [];
         const denoPerms = effective
           ? translateToDenoFlags(effective, moduleDir, approvedRun)
@@ -78,22 +84,162 @@ export class ProcessForker {
           args: ['run', ...denoPerms, '--unstable-sloppy-imports', ...denoArgs, runnerPath],
         };
       }
-      case 'node':
-        return { executable: 'node', args: [runnerPath] };
-      case 'bun':
-        return { executable: 'bun', args: ['run', runnerPath] };
-      case 'python':
-        return { executable: 'python', args: [runnerPath] };
-      case 'php':
-        return { executable: 'php', args: [runnerPath] };
+
+      case 'node': {
+        const gvisorAvailable = this.isGVisorAvailable();
+        if (!gvisorAvailable) {
+          this.logger.warn({ module: manifest.id, runtime: 'node' },
+            'gVisor not available — module runs without sandbox. Install gVisor for OS-level isolation.');
+        }
+        const base = { executable: 'node', args: [runnerPath] };
+        return gvisorAvailable
+          ? this.buildGVisorArgs(base.executable, base.args, manifest, moduleDir)
+          : base;
+      }
+
+      case 'bun': {
+        const gvisorAvailable = this.isGVisorAvailable();
+        if (!gvisorAvailable) {
+          this.logger.warn({ module: manifest.id, runtime: 'bun' },
+            'gVisor not available — module runs without sandbox.');
+        }
+        const base = { executable: 'bun', args: ['run', runnerPath] };
+        return gvisorAvailable
+          ? this.buildGVisorArgs(base.executable, base.args, manifest, moduleDir)
+          : base;
+      }
+
+      case 'python': {
+        const gvisorAvailable = this.isGVisorAvailable();
+        if (!gvisorAvailable) {
+          this.logger.warn({ module: manifest.id, runtime: 'python' },
+            'gVisor not available — module runs without sandbox.');
+        }
+        const base = { executable: 'python', args: [runnerPath] };
+        return gvisorAvailable
+          ? this.buildGVisorArgs(base.executable, base.args, manifest, moduleDir)
+          : base;
+      }
+
+      case 'php': {
+        const gvisorAvailable = this.isGVisorAvailable();
+        if (!gvisorAvailable) {
+          this.logger.warn({ module: manifest.id, runtime: 'php' },
+            'gVisor not available — module runs without sandbox.');
+        }
+        const base = { executable: 'php', args: [runnerPath] };
+        return gvisorAvailable
+          ? this.buildGVisorArgs(base.executable, base.args, manifest, moduleDir)
+          : base;
+      }
+
       case 'go':
       case 'rust':
-      case 'binary':
-        return { executable: runnerPath, args: [] };
+      case 'binary': {
+        const gvisorAvailable = this.isGVisorAvailable();
+        if (!gvisorAvailable) {
+          this.logger.warn({ module: manifest.id, runtime },
+            'gVisor not available — binary module runs without sandbox.');
+        }
+        const base = { executable: runnerPath, args: [] as string[] };
+        return gvisorAvailable
+          ? this.buildGVisorArgs(base.executable, base.args, manifest, moduleDir)
+          : base;
+      }
+
       default:
         this.logger.warn({ module: manifest.id, runtime }, `Unknown runtime "${runtime}" — falling back to deno`);
         return this.buildRuntimeCommand('deno', runnerPath, manifest);
     }
+  }
+
+  private buildDenoSandboxArgs(
+    runnerPath: string,
+    manifest: ModuleManifest,
+  ): { executable: string; args: string[] } {
+    const effective = this.permissionStore?.getEffectivePermissions(manifest.id);
+    const moduleDir = dirname(runnerPath);
+    const approvedRun = effective?.run ?? [];
+    const denoPerms = effective
+      ? translateToDenoFlags(effective, moduleDir, approvedRun)
+      : ['--deny-all'];
+
+    return {
+      executable: Deno.execPath(),
+      args: [
+        'run',
+        '--sandbox',
+        ...denoPerms,
+        '--unstable-sloppy-imports',
+        runnerPath,
+      ],
+    };
+  }
+
+  private buildGVisorArgs(
+    executable: string,
+    args: string[],
+    manifest: ModuleManifest,
+    _moduleDir: string,
+  ): { executable: string; args: string[] } {
+    const effective = this.permissionStore?.getEffectivePermissions(manifest.id);
+
+    const networkArgs = effective?.net?.length
+      ? ['--network-allow', effective.net.join(',')]
+      : ['--network', 'none'];
+
+    const readMounts = (effective?.read ?? [])
+      .flatMap(p => ['--bind-ro', p]);
+    const writeMounts = (effective?.write ?? [])
+      .flatMap(p => ['--bind-rw', p]);
+
+    return {
+      executable: 'runsc',
+      args: [
+        'run',
+        '--rootless',
+        ...networkArgs,
+        ...readMounts,
+        ...writeMounts,
+        '--memory-limit', '512m',
+        '--cpu-limit', '0.5',
+        '--',
+        executable,
+        ...args,
+      ],
+    };
+  }
+
+  private isDenoSandboxAvailable(): boolean {
+    if (this._denoSandboxAvailable !== null) return this._denoSandboxAvailable;
+    try {
+      const result = new Deno.Command(Deno.execPath(), {
+        args: ['--version'],
+        stdout: 'piped',
+        stderr: 'null',
+      }).outputSync();
+      const version = new TextDecoder().decode(result.stdout);
+      const match = version.match(/deno (\d+)\./);
+      this._denoSandboxAvailable = match ? parseInt(match[1]) >= 2 : false;
+    } catch {
+      this._denoSandboxAvailable = false;
+    }
+    return this._denoSandboxAvailable;
+  }
+
+  private isGVisorAvailable(): boolean {
+    if (this._gvisorAvailable !== null) return this._gvisorAvailable;
+    try {
+      new Deno.Command('runsc', {
+        args: ['--version'],
+        stdout: 'null',
+        stderr: 'null',
+      }).outputSync();
+      this._gvisorAvailable = true;
+    } catch {
+      this._gvisorAvailable = false;
+    }
+    return this._gvisorAvailable;
   }
 
   private findDenoConfig(projectRoot: string): string | null {

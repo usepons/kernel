@@ -211,40 +211,49 @@ export class IpcRouter {
       return;
     }
 
+    // Generate kernel-owned internal ID to prevent caller ID collisions
+    const internalId = crypto.randomUUID();
+
     const timer = setTimeout(() => {
-      this.pendingRpc.delete(rpcId);
+      this.pendingRpc.delete(internalId);
       this.ctx.logger.warn({ callerId: callerModuleId, targetService: service, method, timeoutMs: this.ctx.limits.rpcTimeoutMs }, 'rpc.timeout');
       this.send(callerModuleId, { type: 'rpc_response', id: rpcId, error: 'timeout' });
     }, this.ctx.limits.rpcTimeoutMs);
 
     // Publish RPC event for monitoring
-    const rpcEvent = { from: callerModuleId, service, method, id: rpcId, ts: Date.now() };
-    for (const subscriberId of this.ctx.bus.getSubscribers('system:rpc')) {
-      const subEntry = this.ctx.registry.get(subscriberId);
-      if (subEntry?.process?.connected && subEntry.status === 'ready') {
-        this.send(subscriberId, { type: 'deliver', id: crypto.randomUUID(), topic: 'system:rpc', payload: rpcEvent });
+    const rpcSubscribers = this.ctx.bus.getSubscribers('system:rpc');
+    if (rpcSubscribers.length > 0) {
+      for (const subscriberId of rpcSubscribers) {
+        const subEntry = this.ctx.registry.get(subscriberId);
+        if (!subEntry?.process?.connected || subEntry.status !== 'ready') continue;
+        this.send(subscriberId, {
+          type: 'deliver',
+          id: crypto.randomUUID(),
+          topic: 'system:rpc',
+          payload: { from: callerModuleId, service, method, ts: Date.now() },
+        });
       }
     }
 
-    this.pendingRpc.set(rpcId, { callerModuleId, targetModuleId, timer });
+    this.pendingRpc.set(internalId, { callerModuleId, targetModuleId, timer, originalRpcId: rpcId });
     this.send(targetModuleId, {
-      type: 'rpc_request', id: rpcId, from: callerModuleId,
+      type: 'rpc_request', id: internalId, from: callerModuleId,
       service, method, params,
     });
   }
 
-  private onRpcResponse(moduleId: string, rpcId: string, result?: unknown, error?: string): void {
-    const pending = this.pendingRpc.get(rpcId);
+  private onRpcResponse(moduleId: string, internalId: string, result?: unknown, error?: string): void {
+    const pending = this.pendingRpc.get(internalId);
     if (!pending) return;
 
     if (pending.targetModuleId !== moduleId) {
-      this.ctx.logger.warn({ module: moduleId, expected: pending.targetModuleId, rpcId }, 'RPC response from unexpected module — ignoring');
+      this.ctx.logger.warn({ module: moduleId, expected: pending.targetModuleId, internalId }, 'RPC response from unexpected module — ignoring');
       return;
     }
 
     clearTimeout(pending.timer);
-    this.pendingRpc.delete(rpcId);
-    this.send(pending.callerModuleId, { type: 'rpc_response', id: rpcId, result, error });
+    this.pendingRpc.delete(internalId);
+    this.send(pending.callerModuleId, { type: 'rpc_response', id: pending.originalRpcId, result, error });
   }
 
   // ─── Public API ───────────────────────────────────────────────
@@ -330,7 +339,7 @@ export class IpcRouter {
         clearTimeout(pending.timer);
         this.pendingRpc.delete(id);
         this.send(pending.callerModuleId, {
-          type: 'rpc_response', id,
+          type: 'rpc_response', id: pending.originalRpcId,
           error: `Module ${moduleId} stopped while processing RPC`,
         });
       } else if (pending.callerModuleId === moduleId) {

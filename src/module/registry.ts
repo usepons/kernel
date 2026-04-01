@@ -168,17 +168,21 @@ export class ModuleRegistry {
     const manifest = this.modules.get(moduleId)?.manifest;
     if (!manifest?.requires?.length) return null;
 
-    const visited = new Set<string>();
+    // Three-color DFS: white=unvisited, gray=in-progress, black=done
+    const color = new Map<string, 'white' | 'gray' | 'black'>();
     const path: string[] = [];
 
     const dfs = (currentId: string): string[] | null => {
-      if (visited.has(currentId)) {
+      const c = color.get(currentId) ?? 'white';
+
+      if (c === 'black') return null; // already verified — clean
+      if (c === 'gray') {
+        // Found a cycle — return path from cycle start
         const cycleStart = path.indexOf(currentId);
-        if (cycleStart >= 0) return [...path.slice(cycleStart), currentId];
-        return null;
+        return [...path.slice(cycleStart), currentId];
       }
 
-      visited.add(currentId);
+      color.set(currentId, 'gray');
       path.push(currentId);
 
       const entry = this.modules.get(currentId);
@@ -191,9 +195,8 @@ export class ModuleRegistry {
         if (cycle) return cycle;
       }
 
-      // Backtrack: allow re-visiting from different paths (proper DFS)
-      visited.delete(currentId);
       path.pop();
+      color.set(currentId, 'black');
       return null;
     };
 

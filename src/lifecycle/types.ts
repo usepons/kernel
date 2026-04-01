@@ -51,6 +51,7 @@ export interface PendingRpc {
   callerModuleId: string;
   targetModuleId: string;
   timer: ReturnType<typeof setTimeout>;
+  originalRpcId: string;
 }
 
 export interface PendingReady {

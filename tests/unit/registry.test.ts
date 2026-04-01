@@ -172,3 +172,16 @@ Deno.test('ModuleRegistry: detectCircularDeps() detects A→B→A cycle', () => 
   assertEquals(cycle!.includes('a'), true);
   assertEquals(cycle!.includes('b'), true);
 });
+
+Deno.test('ModuleRegistry: detectCircularDeps() — diamond graph no false positive', () => {
+  // Diamond: A→B, A→C, B→D, C→D — no cycle
+  const reg = new ModuleRegistry();
+  reg.register(makeManifest('a', { requires: ['svc-b', 'svc-c'] }));
+  reg.register(makeManifest('b', { requires: ['svc-d'] }));
+  reg.register(makeManifest('c', { requires: ['svc-d'] }));
+  reg.register(makeManifest('d', { provides: ['svc-d'] }));
+  reg.registerServices('b', ['svc-b']);
+  reg.registerServices('c', ['svc-c']);
+  reg.registerServices('d', ['svc-d']);
+  assertEquals(reg.detectCircularDeps('a'), null);
+});
